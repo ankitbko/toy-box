@@ -16,8 +16,13 @@
 
 import { z } from "zod";
 import { PTYManager } from "./pty";
-import { DEFAULT_TERMINAL_WS_PORT } from "../src/types";
-import type { TerminalClientMessage } from "../src/types";
+
+const DEFAULT_TERMINAL_WS_PORT = 3001;
+
+type TerminalClientMessage =
+  | { type: "init"; clientId: string; cols?: number; rows?: number; shell?: string }
+  | { type: "resize"; cols: number; rows: number }
+  | { type: "close" };
 
 const positiveInt = z.number().int().positive();
 const controlPlaneMessageSchema = z.discriminatedUnion("type", [

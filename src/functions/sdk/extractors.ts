@@ -5,12 +5,11 @@
 // so the projector can stay declarative.
 
 import type { JsonValue } from "@/types";
-import type { SessionEvent as CopilotSdkSessionEvent } from "@github/copilot-sdk";
 
 export type UnknownRecord = Record<string, unknown>;
 
 export type SdkSessionEvent = {
-  type: CopilotSdkSessionEvent["type"] | (string & {});
+  type: string;
   timestamp?: string;
   data?: UnknownRecord;
 };

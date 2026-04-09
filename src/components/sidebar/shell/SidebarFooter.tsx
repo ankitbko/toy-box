@@ -1,10 +1,8 @@
 import { useEffect, useState } from "react";
 import { Link } from "@tanstack/react-router";
-import { Settings, SquareTerminal } from "lucide-react";
-import { Input } from "@/components/ui/input";
-import { Checkbox } from "@/components/ui/checkbox";
+import { Settings } from "lucide-react";
 import { Separator } from "@/components/ui/separator";
-import { Toggle } from "@/components/ui/toggle";
+import { Input } from "@/components/ui/input";
 import {
   Dialog,
   DialogContent,
@@ -13,24 +11,26 @@ import {
   DialogTrigger,
 } from "@/components/ui/dialog";
 import { getSettings, updateSetting } from "@/lib/settings";
+import { setAgentUrl } from "@/functions/config";
 
-export interface SidebarFooterProps {
-  onToggleTerminal?: () => void;
-  isTerminalOpen?: boolean;
-}
-
-export function SidebarFooter({ onToggleTerminal, isTerminalOpen }: SidebarFooterProps) {
+export function SidebarFooter() {
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [shell, setShell] = useState("");
-  const [useWorktree, setUseWorktree] = useState(false);
+  const [agentBaseUrl, setAgentBaseUrl] = useState("");
 
   useEffect(() => {
     if (settingsOpen) {
       const s = getSettings();
-      setShell(s.terminalShell);
-      setUseWorktree(s.useWorktree);
+      setAgentBaseUrl(s.agentBaseUrl);
     }
   }, [settingsOpen]);
+
+  const handleAgentUrlSave = () => {
+    const trimmed = agentBaseUrl.trim();
+    updateSetting("agentBaseUrl", trimmed);
+    if (trimmed) {
+      setAgentUrl({ data: { agentBaseUrl: trimmed } });
+    }
+  };
 
   return (
     <Dialog open={settingsOpen} onOpenChange={setSettingsOpen}>
@@ -52,53 +52,27 @@ export function SidebarFooter({ onToggleTerminal, isTerminalOpen }: SidebarFoote
             {import.meta.env.VITE_APP_TITLE}
           </Link>
         </div>
-        {onToggleTerminal && (
-          <Toggle
-            pressed={!!isTerminalOpen}
-            onPressedChange={() => onToggleTerminal()}
-            size="sm"
-            className="h-6 w-6 min-w-6 p-0"
-            aria-label="Toggle terminal"
-            title="Toggle terminal"
-          >
-            <SquareTerminal className="h-4 w-4" />
-          </Toggle>
-        )}
       </div>
       <DialogContent>
         <DialogHeader>
           <DialogTitle>Settings</DialogTitle>
         </DialogHeader>
         <div className="grid gap-4">
-          <div className="grid gap-2">
-            <label htmlFor="terminal-shell" className="text-sm font-medium text-foreground">
-              Terminal shell
+          <div className="space-y-2">
+            <label htmlFor="agent-base-url" className="text-sm font-medium text-foreground">
+              Agent URL
             </label>
             <Input
-              id="terminal-shell"
-              value={shell}
-              onChange={(event) => setShell(event.target.value)}
-              onBlur={() => updateSetting("terminalShell", shell.trim())}
-              placeholder="/bin/zsh or zsh"
-              spellCheck={false}
+              id="agent-base-url"
+              type="url"
+              placeholder="https://{account}.services.ai.azure.com/api/projects/{project}/agents/{agentName}"
+              value={agentBaseUrl}
+              onChange={(e) => setAgentBaseUrl(e.target.value)}
+              onBlur={handleAgentUrlSave}
             />
             <p className="text-xs text-muted-foreground">
-              Provide a full path or a binary on your PATH. Close and reopen the terminal to apply.
+              The hosted agent base URL. Falls back to the AGENT_BASE_URL environment variable.
             </p>
-          </div>
-          <div className="flex items-center gap-2">
-            <Checkbox
-              id="use-worktree"
-              checked={useWorktree}
-              onCheckedChange={(checked) => {
-                const value = checked === true;
-                setUseWorktree(value);
-                updateSetting("useWorktree", value);
-              }}
-            />
-            <label htmlFor="use-worktree" className="text-sm font-medium text-foreground">
-              Start new sessions in a worktree
-            </label>
           </div>
         </div>
       </DialogContent>

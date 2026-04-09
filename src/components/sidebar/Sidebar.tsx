@@ -51,10 +51,6 @@ export interface SidebarProps {
   // Shell props (desktop only)
   onCollapse?: () => void;
 
-  // Terminal props
-  onToggleTerminal?: () => void;
-  isTerminalOpen?: boolean;
-
   // Styling
   className?: string;
 }
@@ -101,10 +97,6 @@ export function Sidebar({
 
   // Shell props
   onCollapse,
-
-  // Terminal props
-  onToggleTerminal,
-  isTerminalOpen,
 
   // Styling
   className,
@@ -164,7 +156,7 @@ export function Sidebar({
         />
       </div>
 
-      <SidebarFooter onToggleTerminal={onToggleTerminal} isTerminalOpen={isTerminalOpen} />
+      <SidebarFooter />
     </div>
   );
 }

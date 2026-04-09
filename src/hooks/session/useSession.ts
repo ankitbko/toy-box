@@ -11,7 +11,14 @@ import {
   enqueueMessage,
   cancelQueuedMessage as serverCancelQueuedMessage,
 } from "@/functions/sessions";
-import type { Attachment, Message, QueuedMessage, SessionEvent, SessionStatus, TodoItem } from "@/types";
+import type {
+  Attachment,
+  Message,
+  QueuedMessage,
+  SessionEvent,
+  SessionStatus,
+  TodoItem,
+} from "@/types";
 import {
   applySessionEvent,
   createInitialSession,
@@ -334,9 +341,6 @@ export function useSession(sessionId: string, sessionConfig?: SessionConfig) {
             directory: isFirstMessageToDraft
               ? (options?.directory ?? sessionConfig?.directory)
               : undefined,
-            useWorktree: isFirstMessageToDraft
-              ? sessionConfig?.useWorktree
-              : undefined,
           },
           {
             // Fired once the stream request is established.
@@ -359,6 +363,9 @@ export function useSession(sessionId: string, sessionConfig?: SessionConfig) {
           },
         );
       } catch (error) {
+        // AbortErrors are expected when navigating away during streaming
+        if (error instanceof Error && error.name === "AbortError") return;
+        if (error instanceof DOMException && error.name === "AbortError") return;
         console.error("Streaming error:", error);
         sessionRef.current!.state = createStreamErrorState(sessionRef.current!.state);
         updateRevision();
@@ -432,21 +439,21 @@ export function useSession(sessionId: string, sessionConfig?: SessionConfig) {
   const attachToStream = useCallback(async () => {
     if (abortControllerRef.current) return; // Already streaming
 
-    // Prevent server sync from overwriting our streaming state
-
     try {
       const result = await runStreamingLoop({
         sessionId,
         afterEventId: sessionRef.current!.state.lastSeenEventId,
       });
-      // Always reconcile against authoritative detail state when a passive
-      // subscribe completes so the cached detail reflects the latest server state.
+      // Reconcile against persistent history when a passive subscribe completes.
       if (!result.wasAborted) {
         await invalidateDetailQuery();
       }
     } catch (error) {
+      // AbortErrors are expected when navigating away or detaching
+      if (error instanceof Error && error.name === "AbortError") return;
+      if (error instanceof DOMException && error.name === "AbortError") return;
       console.error("Subscription error:", error);
-      await invalidateDetailQuery();
+      await invalidateDetailQuery().catch(() => {});
     }
   }, [invalidateDetailQuery, runStreamingLoop, sessionId]);
 

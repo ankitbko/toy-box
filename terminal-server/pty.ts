@@ -1,7 +1,7 @@
 import { ScrollbackBuffer } from "./scrollback";
 
 import type { ServerWebSocket, Subprocess } from "bun";
-import type { TerminalServerMessage } from "../src/types";
+type TerminalServerMessage = { type: "ready"; resumed: boolean } | { type: "exit" };
 import type { WebSocketData } from "./";
 
 const ORPHAN_TIMEOUT_MS = 30_000; // 30 seconds

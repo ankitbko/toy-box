@@ -1,18 +1,19 @@
-// Session streaming runtime — bridges the Copilot SDK's event-driven session
-// model to the HTTP streaming interface consumed by the client. Owns the
-// per-session event pipeline (SDK event → projected SessionEvent → streaming
-// buffer → SSE listener), turn lifecycle, and the queued-message drain loop
-// that sends follow-up prompts between turns.
-//
-// The SessionStream class encapsulates all per-stream state: the event buffer,
-// queued messages, subscribers, SDK listener, and reducer state. External
-// callers use the static registry (get / getOrCreate / close) and instance
-// methods — never reaching into internal fields directly.
+// Session streaming runtime — bridges the remote Foundry hosted agent's
+// SSE event stream to the HTTP streaming interface consumed by the client.
+// Owns the per-session event pipeline (remote SSE → projected SessionEvent →
+// streaming buffer → client listener), turn lifecycle, and the queued-message
+// drain loop that sends follow-up prompts between turns.
 
-import type { CopilotSession } from "@github/copilot-sdk";
-import { createSession, getOrResumeSession } from "../state/sessionCache";
+import { invokeAgent } from "../remote/client";
+import {
+  adaptRemoteEvent,
+  createEventAdapterState,
+  getRemoteMetadataPatch,
+  getRemoteStreamTerminal,
+} from "../remote/eventAdapter";
+import type { RemoteSdkEvent } from "../remote/types";
+import { createSession, getAgentConfig } from "../state/sessionCache";
 import { markSessionUnread, markSessionRead } from "../state/unread";
-import { writeAttachments } from "../state/attachments";
 import {
   emitSessionRunning,
   emitSessionIdle,
@@ -20,15 +21,10 @@ import {
   updateSessionSummary,
 } from "./broadcast";
 import { applySessionEvent, createInitialSession } from "@/lib/session/sessionReducer";
-import { type SdkSessionEvent, readSessionModel } from "@/functions/sdk/extractors";
-import {
-  createProjectionState,
-  getSdkMetadataPatch,
-  getSdkStreamTerminalDisposition,
-  projectSdkEvent,
-} from "@/functions/sdk/projector";
 import type { Attachment, QueuedMessage, SessionEvent } from "@/types";
 import type { Session } from "@/lib/session/sessionReducer";
+import { getSessionMetadataStore } from "../state/sessionStore";
+import { recordCompletedRun } from "../state/sessionHistory";
 
 export type SessionStreamConfig = {
   sessionId: string;
@@ -36,7 +32,6 @@ export type SessionStreamConfig = {
   attachments?: Attachment[];
   model?: string;
   directory?: string;
-  useWorktree?: boolean;
 
   clientMessageId?: string;
   afterEventId?: number;
@@ -56,15 +51,11 @@ export class SessionStream {
     return SessionStream.streams.get(sessionId);
   }
 
-  static getOrCreate(
-    sessionId: string,
-    session: CopilotSession,
-    initialModel?: string,
-  ): SessionStream {
+  static getOrCreate(sessionId: string, initialModel?: string): SessionStream {
     const existing = SessionStream.streams.get(sessionId);
     if (existing) return existing;
 
-    const stream = new SessionStream(sessionId, session);
+    const stream = new SessionStream(sessionId);
     if (initialModel) {
       stream.#turnState.model = initialModel;
     }
@@ -93,7 +84,6 @@ export class SessionStream {
   // ── Instance fields ──────────────────────────────────────────────────
 
   readonly sessionId: string;
-  private readonly sdkSession: CopilotSession;
 
   // Event buffer
   #buffer: SessionEvent[] = [];
@@ -103,55 +93,62 @@ export class SessionStream {
   // Subscribers
   readonly #subscribers = new Set<SessionStreamSubscriber>();
 
-  // SDK event listener
-  #unsubscribeSdk: () => void;
+  // Event adapter state
+  #adapterState = createEventAdapterState();
 
   // Reducer state
   #turnState: Session;
-  #projectionState = createProjectionState();
+
+  // Stream lifecycle
+  #closed = false;
 
   // Event sequencing
   #nextEventId = 1;
   #currentTurnId: string | undefined;
   #isDrainingQueue = false;
 
+  // Run ID for event persistence (unique per turn/invocation)
+  #runId: string = crypto.randomUUID();
+
   // ── Constructor ──────────────────────────────────────────────────────
 
-  private constructor(sessionId: string, sdkSession: CopilotSession) {
+  private constructor(sessionId: string) {
     this.sessionId = sessionId;
-    this.sdkSession = sdkSession;
     this.#turnState = createInitialSession();
-    this.#unsubscribeSdk = sdkSession.on((event) => this.#handleSdkEvent(event));
   }
 
   // ── Lifecycle ────────────────────────────────────────────────────────
 
-  /** Full shutdown: buffer + queue + unread + broadcast + SDK listener. */
+  /** Full shutdown: persist run history, clear buffer + queue + unread + broadcast. */
   close(): void {
+    if (this.#closed) return;
+    this.#closed = true;
+
+    // Record this run's messages into the global session history.
+    // This is synchronous (in-memory on globalThis) so querySession
+    // can read it immediately. SQLite write happens in the background.
+    if (this.#turnState.messages.length > 0) {
+      recordCompletedRun(this.sessionId, this.#runId, this.#turnState);
+    }
+
     this.#updateUnreadOnStreamEnd();
     this.#clearBuffer();
     this.#turnState.queuedMessages.length = 0;
     this.#broadcastToSubscribers(null);
-    this.#unsubscribeSdk();
     SessionStream.streams.delete(this.sessionId);
   }
 
-  /** Abort the in-flight turn on the SDK and close the stream. */
+  /** Abort the in-flight turn. For remote agents, just close the stream. */
   async abort(): Promise<void> {
-    await this.sdkSession.abort();
     this.close();
   }
 
-  /** Lightweight cleanup: unsubscribe SDK + remove from registry.
-   *  Used when the stream already closed normally and we just need
-   *  to clean up the runtime object itself. */
+  /** Lightweight cleanup: remove from registry. */
   detach(): void {
-    this.#unsubscribeSdk();
     SessionStream.streams.delete(this.sessionId);
   }
 
-  /** Mark a send failure: clear the buffer and update unread, but keep
-   *  the runtime alive so the caller can still detach it. */
+  /** Mark a send failure: clear the buffer and update unread. */
   markSendFailure(): void {
     this.#updateUnreadOnStreamEnd();
     this.#clearBuffer();
@@ -163,17 +160,14 @@ export class SessionStream {
     return this.#turnState.model;
   }
 
-  /** Update the model on both the SDK session and local state. */
-  async setModel(model: string): Promise<void> {
+  /** Update the model for the next invocation. */
+  setModel(model: string): void {
     if (model === this.#turnState.model) return;
-
-    await this.sdkSession.setModel(model);
     this.#turnState.model = model;
   }
 
   // ── Buffer ───────────────────────────────────────────────────────────
 
-  /** Prepare buffer for a new turn. Emits "running" on the first call. */
   #prepareBuffer(summaryHint?: string): void {
     this.#buffer.length = 0;
 
@@ -183,6 +177,15 @@ export class SessionStream {
     }
 
     emitSessionTouched(this.sessionId, { summary: summaryHint });
+
+    // Persist summary to SQLite so it survives refetches
+    if (summaryHint) {
+      getSessionMetadataStore()
+        .then((store) => store.updateSummary(this.sessionId, summaryHint))
+        .catch((err) => {
+          console.error(`[stream] Failed to persist summary:`, err);
+        });
+    }
   }
 
   #appendToBuffer(event: SessionEvent): void {
@@ -289,8 +292,6 @@ export class SessionStream {
     }
   }
 
-  /** True when no subscribers are attached, nothing is queued, and the
-   *  buffer is empty — safe to detach without losing state. */
   #isIdle(): boolean {
     return (
       this.#subscribers.size === 0 &&
@@ -302,8 +303,7 @@ export class SessionStream {
 
   // ── Event pipeline ──────────────────────────────────────────────────
 
-  /** Begin a new turn: reset state, emit the user message, and prepare
-   *  the buffer for incoming assistant events. */
+  /** Begin a new turn: reset state, emit the user message, prepare buffer. */
   startTurn(prompt: string, clientMessageId?: string): void {
     this.#resetForNewTurn(prompt);
     this.#emit({
@@ -323,6 +323,7 @@ export class SessionStream {
   #resetForNewTurn(summaryHint?: string): void {
     this.#prepareBuffer(summaryHint);
     this.#currentTurnId = undefined;
+    this.#adapterState = createEventAdapterState();
 
     const currentModel = this.#turnState.model;
     this.#turnState = createInitialSession();
@@ -349,30 +350,64 @@ export class SessionStream {
     applySessionEvent(this.#turnState, event);
   }
 
-  // ── SDK event handling ──────────────────────────────────────────────
+  // ── Remote agent invocation ─────────────────────────────────────────
 
-  #handleSdkEvent(sdkEvent: SdkSessionEvent): void {
-    const metadataPatch = getSdkMetadataPatch(sdkEvent);
+  /** Public entry point for fire-and-forget invocation from createSessionEventStream. */
+  async invokeRemoteAgentPublic(prompt: string, model?: string): Promise<void> {
+    return this.#invokeRemoteAgent(prompt, model);
+  }
+
+  /** Invoke the remote agent and process the SSE event stream. */
+  async #invokeRemoteAgent(prompt: string, model?: string): Promise<void> {
+    try {
+      const config = getAgentConfig();
+      const { events } = await invokeAgent(config, this.sessionId, {
+        input: prompt,
+        model: model || this.#turnState.model,
+      });
+
+      for await (const remoteEvent of events) {
+        if (this.#closed) break;
+        this.#handleRemoteEvent(remoteEvent);
+      }
+
+      // Stream ended — drain the queue or close (unless already closed by error terminal)
+      if (!this.#closed) {
+        this.#drainMessageQueue();
+      }
+    } catch (error) {
+      console.error(`[stream] ${this.sessionId} invocation error:`, error);
+      this.close();
+    }
+  }
+
+  #handleRemoteEvent(remoteEvent: RemoteSdkEvent): void {
+    const metadataPatch = getRemoteMetadataPatch(remoteEvent);
     if (metadataPatch) {
       updateSessionSummary(this.sessionId, metadataPatch.summary, {
         replace: metadataPatch.replaceSummary,
       });
+      // Also persist the summary locally
+      getSessionMetadataStore()
+        .then((store) =>
+          store.updateSummary(this.sessionId, metadataPatch.summary, {
+            replace: metadataPatch.replaceSummary,
+          }),
+        )
+        .catch(console.error);
     }
 
-    const streamTerminal = getSdkStreamTerminalDisposition(sdkEvent.type);
+    const streamTerminal = getRemoteStreamTerminal(remoteEvent);
     if (streamTerminal) {
       if (streamTerminal === "error") {
         this.close();
         return;
       }
-      this.#drainMessageQueue();
+      // "idle" terminal — handled by the invokeRemoteAgent caller
       return;
     }
 
-    for (const sessionEvent of projectSdkEvent(sdkEvent, {
-      streaming: true,
-      state: this.#projectionState,
-    })) {
+    for (const sessionEvent of adaptRemoteEvent(remoteEvent, this.#adapterState)) {
       if (
         (sessionEvent.type === "delta" || sessionEvent.type === "reasoning") &&
         sessionEvent.content.length === 0
@@ -380,7 +415,7 @@ export class SessionStream {
         continue;
       }
 
-      this.#emit(sessionEvent, sdkEvent.type);
+      this.#emit(sessionEvent, remoteEvent.type);
     }
   }
 
@@ -400,21 +435,18 @@ export class SessionStream {
       this.#resetForNewTurn(queuedMessage.content);
       this.#currentTurnId = this.#generateTurnId();
 
-      // Emit removes the message from #turnState.queuedMessages via applySessionEvent.
       this.#emit({
         type: "message_dequeued",
         content: queuedMessage.content,
         queuedMessageId: queuedMessage.id,
       });
 
-      const attachments = await writeAttachments(this.sessionId, queuedMessage.attachments);
-
-      if (queuedMessage.model && queuedMessage.model !== this.#turnState.model) {
-        await this.sdkSession.setModel(queuedMessage.model);
-        this.#turnState.model = queuedMessage.model;
+      const model = queuedMessage.model || this.#turnState.model;
+      if (model && model !== this.#turnState.model) {
+        this.#turnState.model = model;
       }
 
-      await this.sdkSession.send({ prompt: queuedMessage.content, attachments });
+      await this.#invokeRemoteAgent(queuedMessage.content, model);
     } catch (err) {
       console.error(`[DRAIN] ${this.sessionId} error:`, err);
       this.close();
@@ -427,15 +459,6 @@ export class SessionStream {
 // ============================================================================
 // Streaming Entry Point
 // ============================================================================
-
-/** Extract the last-known model from SDK history events (scans backwards). */
-function getModelFromSdkEvents(events: SdkSessionEvent[]): string | undefined {
-  for (let i = events.length - 1; i >= 0; i--) {
-    const model = readSessionModel(events[i]);
-    if (model) return model;
-  }
-  return undefined;
-}
 
 function createAsyncQueue<T>() {
   const queue: (T | null)[] = [];
@@ -486,45 +509,32 @@ export async function* createSessionEventStream(
     return;
   }
 
-  let sdkSession: CopilotSession;
-  let sdkModel: string | undefined;
-
   if (shouldStartNew) {
-    sdkSession = await createSession(options.sessionId, {
-      model: options.model,
-      directory: options.directory,
-      useWorktree: options.useWorktree,
-    });
-    sdkModel = options.model;
-  } else {
-    const resumed = await getOrResumeSession(options.sessionId);
-    sdkSession = resumed.session;
-    sdkModel = getModelFromSdkEvents(resumed.events);
+    await createSession(options.sessionId, { model: options.model });
   }
 
-  const stream = SessionStream.getOrCreate(options.sessionId, sdkSession, sdkModel);
+  const stream = SessionStream.getOrCreate(options.sessionId, options.model);
 
   const { push, pull } = createAsyncQueue<SessionEvent>();
   const unsubscribe = stream.subscribe(push);
 
   try {
     if (hasPrompt) {
-      // Send path: start a new turn, set model if changed, send to SDK.
+      // Send path: start a new turn and invoke the remote agent.
       stream.startTurn(options.prompt!, options.clientMessageId);
 
       if (options.model) {
-        await stream.setModel(options.model);
+        stream.setModel(options.model);
       }
-      const attachments = await writeAttachments(options.sessionId, options.attachments);
-      try {
-        await sdkSession.send({ prompt: options.prompt!, attachments });
-      } catch (error) {
+
+      // Fire-and-forget the remote invocation — events flow through the subscriber
+      stream.invokeRemoteAgentPublic(options.prompt!, options.model).catch((error) => {
+        console.error(`[stream] ${options.sessionId} invocation error:`, error);
         stream.markSendFailure();
-        throw error;
-      }
+        stream.close();
+      });
     } else {
       // Reconnect path: replay buffered events then wait for live events.
-      // The early-return guard above ensures a stream is always active here.
       for (const event of stream.getBufferSince(options.afterEventId)) {
         yield event;
       }

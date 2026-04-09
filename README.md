@@ -4,26 +4,25 @@
 
 ## Features
 
-1. Start + resume agentic coding sessions against your local dev box
+1. Start + resume agentic coding sessions via Foundry hosted agents
 1. CMD+click sessions to open a grid of sessions (up to 4)
 1. Sessions track in-progress/unread state, which is synced across all clients
-1. Integrated terminal allows running shell commands as needed
 1. PWA/responsive layout makes working on sessions from your phone a breeze
 1. Automated sessions allow you to schedule recurring tasks
 
 ## Getting Started
 
-1. Install the Copilot CLI and authenticate with your GitHub account
-1. `cd` into the project directory you want to work on remotely
+1. Install the [Azure CLI](https://learn.microsoft.com/en-us/cli/azure/install-azure-cli) and authenticate with `az login`
+1. Deploy a GitHub Copilot hosted agent to Foundry (see the [hosted-agents sample](https://github.com/microsoft/hosted-agents-vnext-private-preview))
+1. Set the `AGENT_BASE_URL` environment variable to your agent's base URL, or configure it in the Settings dialog
 1. Run `npx @lostintangent/toy-box` (or `bunx @lostintangent/toy-box`)
-1. Start running agentic tasks on your machine 🚀
+1. Start running agentic tasks on your hosted agent 🚀
 
-If you'd also like to be able to access your toy box server from your phone and/or other devices, then simply setup [Tailscale](https://tailscale.com/) and access the UI via `http://<machine-ip-or-dns-name>:3000`.
-
-> Note: You can also install the Toy Box CLI globally and run it via `toy-box`.
+> **Note:** Terminal support is not available with hosted agents (WebSocket not supported).
 
 ## Developing
 
 1. Clone this repo
 1. Run `bun install`
+1. Set `AGENT_BASE_URL` to your hosted agent URL
 1. Run `bun dev`

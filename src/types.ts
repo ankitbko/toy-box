@@ -1,7 +1,33 @@
 // Shared types that cross the client/server boundary
 
-import type { SessionContext } from "@github/copilot-sdk";
-export type { SessionMetadata, SessionContext, ModelInfo } from "@github/copilot-sdk";
+export type SessionContext = {
+  cwd?: string;
+  gitRoot?: string;
+  repository?: string;
+  branch?: string;
+};
+
+export type SessionMetadata = {
+  sessionId: string;
+  startTime: Date;
+  modifiedTime: Date;
+  summary?: string;
+  isRemote?: boolean;
+  context?: SessionContext;
+};
+
+export type ModelInfo = {
+  id: string;
+  name: string;
+};
+
+export type SessionWorktree = {
+  path?: string;
+  branch?: string;
+  baseBranch?: string;
+  linesAdded?: number;
+  linesRemoved?: number;
+};
 
 /* Skills (directory-scoped — resolved from .claude/ dirs, plugins, etc.) */
 
@@ -195,18 +221,8 @@ export type SessionMetadataUpdate = {
   replaceSummary?: boolean;
   isRemote?: boolean;
   context?: SessionContext;
+  worktree?: SessionWorktree;
 };
-
-/* Terminal (client->server protocol) */
-
-export const DEFAULT_TERMINAL_WS_PORT = 3001;
-
-export type TerminalClientMessage =
-  | { type: "init"; clientId: string; cols?: number; rows?: number; shell?: string }
-  | { type: "resize"; cols: number; rows: number }
-  | { type: "close" };
-
-export type TerminalServerMessage = { type: "ready"; resumed: boolean } | { type: "exit" };
 
 /* Automations */
 

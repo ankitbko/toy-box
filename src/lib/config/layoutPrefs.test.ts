@@ -6,8 +6,6 @@ import {
   LAYOUT_COOKIE_MAX_AGE,
   SIDEBAR_OPEN_COOKIE,
   SIDEBAR_SIZE_COOKIE,
-  TERMINAL_OPEN_COOKIE,
-  TERMINAL_SIZE_COOKIE,
   parseLayoutPrefs,
   resolveLayoutPrefs,
 } from "./layoutPrefs";
@@ -16,17 +14,13 @@ describe("layout prefs", () => {
   test("parses layout cookies including automations expanded state", () => {
     const cookieHeader = [
       `${SIDEBAR_SIZE_COOKIE}=18`,
-      `${TERMINAL_SIZE_COOKIE}=42`,
       `${SIDEBAR_OPEN_COOKIE}=false`,
-      `${TERMINAL_OPEN_COOKIE}=true`,
       `${AUTOMATIONS_EXPANDED_COOKIE}=false`,
     ].join("; ");
 
     expect(parseLayoutPrefs(cookieHeader)).toEqual({
       sidebarSize: 18,
-      terminalSize: 42,
       sidebarOpen: false,
-      terminalOpen: true,
       automationsExpanded: false,
     });
   });

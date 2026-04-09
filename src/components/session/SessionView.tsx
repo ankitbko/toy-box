@@ -19,10 +19,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Message as SessionMessage } from "./messages/Message";
 import { StatusIndicator, ReasoningDisplay } from "./SessionStatus";
 import type { SessionStatus } from "@/types";
-import {
-  SessionLocationPicker,
-  type SessionLocationPickerProps,
-} from "./SessionLocationPicker";
+import { SessionLocationPicker, type SessionLocationPickerProps } from "./SessionLocationPicker";
 import type { WorktreeProps } from "./WorktreeBranchMenu";
 import { SessionMetadataBadges } from "./SessionMetadataBadges";
 import {

@@ -1,180 +1,100 @@
-// CopilotSession object cache and session lifecycle orchestration.
+// Session lifecycle orchestration for remote Foundry hosted agents.
 //
-// The SDK persists sessions to disk; this module caches live
-// CopilotSession objects in memory to avoid redundant resume calls.
-// It also owns the deleteSession workflow, which coordinates cleanup
-// across streaming buffers, unread state, attachments, and SDK
-// persistence.
+// Platform sessions (microVMs) are managed via the Foundry session API.
+// This module coordinates session creation, deletion, and cleanup across
+// streaming buffers, unread state, attachments, and local metadata.
 
-import { homedir } from "node:os";
-import type { CopilotSession } from "@github/copilot-sdk";
-import {
-  createSession as sdkCreateSession,
-  resumeSession as sdkResumeSession,
-  deleteSession as sdkDeleteSession,
-  readSessionContextFromEvents,
-} from "../sdk/client";
+import { createPlatformSession, deletePlatformSession } from "../remote/sessionApi";
+import type { HostedAgentConfig } from "../remote/types";
 import { emitSessionUpsert, emitSessionDelete } from "../runtime/broadcast";
 import { SessionStream } from "../runtime/stream";
 import { deleteUnreadState } from "./unread";
 import { cleanupSessionAttachments } from "./attachments";
-import {
-  getSessionWorktree,
-  upsertSessionWorktree,
-  deleteSessionWorktree,
-} from "./worktreeMetadata";
-import { createWorktree, cleanupWorktree, detectGitRoot, getRepositoryName } from "../worktrees";
+import { getSessionMetadataStore } from "./sessionStore";
 
-const activeSessions = new Map<string, CopilotSession>();
+// ============================================================================
+// Agent Configuration (on globalThis to survive Vite module reloads in dev)
+// ============================================================================
+
+const AGENT_CONFIG_KEY = "__toybox_agentConfig";
+
+function getGlobal(): Record<string, unknown> {
+  return globalThis as Record<string, unknown>;
+}
+
+export function getAgentConfig(): HostedAgentConfig {
+  const config = getGlobal()[AGENT_CONFIG_KEY] as HostedAgentConfig | undefined;
+  if (!config) {
+    throw new Error("Agent config not set. Configure the hosted agent URL in settings.");
+  }
+  return config;
+}
+
+export function setAgentConfig(config: HostedAgentConfig): void {
+  getGlobal()[AGENT_CONFIG_KEY] = config;
+}
+
+export function hasAgentConfig(): boolean {
+  return getGlobal()[AGENT_CONFIG_KEY] !== undefined;
+}
+
+// ============================================================================
+// Session Lifecycle
+// ============================================================================
 
 export type CreateSessionOptions = {
   model?: string;
   directory?: string;
-  useWorktree?: boolean;
 };
 
-/** Create a new session with a specific ID and cache it (for draft sessions) */
+/** Create a new platform session and emit an upsert event */
 export async function createSession(
   sessionId: string,
-  options?: CreateSessionOptions,
-): Promise<CopilotSession> {
-  let { directory, model, useWorktree } = options ?? {};
+  _options?: CreateSessionOptions,
+): Promise<string> {
+  const config = getAgentConfig();
 
-  // If requested, create a git worktree and redirect the session into it.
-  // Capture the original repo context so the initial SSE upsert shows the
-  // correct repository name instead of the worktree hash.
-  let originalGitRoot: string | undefined;
-  let originalRepository: string | undefined;
-  let worktreeRecord: { path: string; branch: string; baseBranch: string } | undefined;
-  if (useWorktree && directory) {
-    const gitRoot = await detectGitRoot(directory);
-    if (gitRoot) {
-      originalGitRoot = gitRoot;
-      originalRepository = await getRepositoryName(gitRoot);
+  await createPlatformSession(config, { agent_session_id: sessionId });
 
-      const worktree = await createWorktree(gitRoot, sessionId);
-      directory = worktree.path;
-
-      worktreeRecord = {
-        path: worktree.path,
-        branch: worktree.branch,
-        baseBranch: worktree.baseBranch,
-      };
-      await upsertSessionWorktree(sessionId, worktreeRecord);
-    }
-  }
-
-  // The SDK requires a working directory. When none was explicitly provided
-  // (e.g. automations with no cwd), fall back to the user's home directory
-  // so the SDK has a valid path without leaking the server's cwd.
-  const session = await sdkCreateSession(sessionId, model, directory ?? homedir());
   const now = new Date().toISOString();
-  activeSessions.set(sessionId, session);
 
-  // Emit immediately so the session appears in the list right away.
-  // Only include context when a directory was explicitly provided —
-  // sessions without a directory (e.g. automations) have no location.
+  // Persist initial metadata locally (platform doesn't store summaries)
+  const store = await getSessionMetadataStore();
+  await store.upsert(sessionId, "");
+
+  // Emit immediately so the session appears in the sidebar
   emitSessionUpsert({
     sessionId,
     startTime: now,
     modifiedTime: now,
     summary: "",
-    isRemote: false,
-    context: directory
-      ? {
-          cwd: directory,
-          ...(originalGitRoot && { gitRoot: originalGitRoot }),
-          ...(originalRepository && { repository: originalRepository }),
-        }
-      : undefined,
-    worktree: worktreeRecord,
+    isRemote: true,
   });
 
-  // Backfill full context (gitRoot, repository, branch) from the SDK's
-  // session.start event once it's written to disk. Skip for directory-less
-  // sessions — their events.jsonl contains the homedir fallback, not a
-  // meaningful location the user chose.
-  if (directory) {
-    readSessionContextFromEvents(sessionId).then((context) => {
-      if (context) {
-        emitSessionUpsert({ sessionId, context });
-      }
-    });
-  }
-  return session;
+  return sessionId;
 }
 
-/** Get a cached session or resume it from SDK persistence */
-export async function getCachedOrResumeSession(sessionId: string): Promise<CopilotSession> {
-  const cached = activeSessions.get(sessionId);
-  if (cached) return cached;
-
-  const session = await sdkResumeSession(sessionId);
-  activeSessions.set(sessionId, session);
-  return session;
-}
-
-function isSessionNotFoundError(error: unknown): boolean {
-  if (!(error instanceof Error)) return false;
-  const message = error.message.toLowerCase();
-  return (
-    message.includes("session not found") ||
-    message.includes("unknown session") ||
-    message.includes("session file not found")
-  );
-}
-
-/** Resume a session and fetch its messages, retrying once if the cached session is stale */
-export async function getOrResumeSession(sessionId: string): Promise<{
-  session: CopilotSession;
-  events: Awaited<ReturnType<CopilotSession["getMessages"]>>;
-}> {
-  let session = await getCachedOrResumeSession(sessionId);
-  try {
-    const events = await session.getMessages();
-    return { session, events };
-  } catch (error) {
-    if (!isSessionNotFoundError(error)) throw error;
-    evictCachedSession(sessionId);
-
-    session = await getCachedOrResumeSession(sessionId);
-    const events = await session.getMessages();
-    return { session, events };
-  }
-}
-
-/** Remove a cached session so the next access forces a resume */
-export function evictCachedSession(sessionId: string): void {
-  activeSessions.delete(sessionId);
-}
-
-/** Check whether a session currently has a cached live SDK session object. */
-export function hasCachedSession(sessionId: string): boolean {
-  return activeSessions.has(sessionId);
-}
-
-/** Delete a session (worktree + cache + streaming + unread + attachments + SDK persistence) */
+/** Delete a session (stream + unread + attachments + platform + local metadata + history) */
 export async function deleteSession(sessionId: string): Promise<void> {
-  // Clean up worktree if this was a worktree session
-  const worktree = await getSessionWorktree(sessionId);
-  if (worktree?.path && worktree.branch) {
-    await cleanupWorktree({
-      path: worktree.path,
-      branch: worktree.branch,
-    }).catch(console.error);
-  }
-  await deleteSessionWorktree(sessionId);
-
-  const cached = activeSessions.get(sessionId);
-  if (cached) {
-    await cached.destroy();
-    activeSessions.delete(sessionId);
-  }
-
   SessionStream.remove(sessionId);
   deleteUnreadState(sessionId);
-
   await cleanupSessionAttachments(sessionId);
-  await sdkDeleteSession(sessionId);
+
+  // Clear in-memory run history
+  const { clearSessionHistory } = await import("./sessionHistory");
+  clearSessionHistory(sessionId);
+
+  // Delete from local metadata store
+  const store = await getSessionMetadataStore();
+  await store.delete(sessionId);
+
+  // Delete from platform
+  try {
+    const config = getAgentConfig();
+    await deletePlatformSession(config, sessionId);
+  } catch (error) {
+    console.error(`Failed to delete platform session ${sessionId}:`, error);
+  }
+
   emitSessionDelete(sessionId);
 }

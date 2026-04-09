@@ -6,7 +6,8 @@ import { statSync } from "node:fs";
 
 import { version } from "../package.json";
 import { startTerminalServer } from "../terminal-server/index";
-import { DEFAULT_TERMINAL_WS_PORT } from "../src/types";
+
+const DEFAULT_TERMINAL_WS_PORT = 3001;
 
 const MIN_PORT = 1;
 const MAX_PORT = 65_535;

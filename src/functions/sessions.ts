@@ -1,39 +1,29 @@
-// Server function definitions for session management
+// Server function definitions for session management (remote hosted agent)
 // These are the RPC boundary — safe to import from anywhere
 
-import { createMiddleware, createServerFn } from "@tanstack/react-start";
+import { createServerFn } from "@tanstack/react-start";
 import { RawStream } from "@tanstack/router-core";
 import { zodValidator } from "@tanstack/zod-adapter";
 import { z } from "zod";
-import { listAllSessions, listAvailableModels } from "./sdk/client";
-import { getOrResumeSession, getCachedOrResumeSession, deleteSession } from "./state/sessionCache";
-import { getUnreadSessionIds, markSessionUnread, markSessionRead } from "./state/unread";
-import { readAttachment } from "./state/attachments";
-import {
-  getAllSessionWorktrees,
-  getSessionWorktree,
-  deleteSessionWorktree,
-} from "./state/worktreeMetadata";
+import { listSessions } from "./remote/sessionApi";
+import { getAgentConfig, hasAgentConfig, deleteSession } from "./state/sessionCache";
+import { getSessionMetadataStore } from "./state/sessionStore";
+import { getUnreadSessionIds, markSessionRead } from "./state/unread";
 import { SessionStream, createSessionEventStream } from "./runtime/stream";
 import {
-  cleanupWorktree,
-  mergeWorktreeBranch,
-  applyWorktreeBranch,
-  detectGitRoot,
-} from "./worktrees";
+  getAllMessagesWithSeparators,
+  getLastCompletedState,
+  loadHistoryFromSqlite,
+} from "./state/sessionHistory";
 import type {
-  Attachment,
   Message,
   ModelInfo,
   SessionEvent,
   SessionMetadata,
   SessionSkill,
   SessionSnapshot,
-  SessionStatus,
   SessionWorktree,
 } from "@/types";
-import { applySessionEvent, createInitialSession } from "@/lib/session/sessionReducer";
-import { projectSessionEventsFromSdkHistory } from "@/functions/sdk/projector";
 import { encodeSessionEvent } from "@/lib/session/streamCodec";
 
 // ============================================================================
@@ -58,11 +48,9 @@ const streamInputSchema = z.object({
       }),
     )
     .optional(),
-  // For draft sessions: create the session on first message instead of resuming
   startNew: z.boolean().optional(),
   model: z.string().optional(),
   directory: z.string().optional(),
-  useWorktree: z.boolean().optional(),
 });
 
 const enqueueInputSchema = z.object({
@@ -92,25 +80,6 @@ const sessionsStateInputSchema = z
   .default({});
 
 // ============================================================================
-// Middleware
-// ============================================================================
-
-/** Middleware that validates sessionId input - reused across multiple server functions */
-const withSessionId = createMiddleware({ type: "function" }).inputValidator(
-  zodValidator(sessionInputSchema),
-);
-
-async function readHistoryAttachments(attachments: unknown): Promise<Attachment[] | undefined> {
-  if (!Array.isArray(attachments) || attachments.length === 0) return undefined;
-
-  return Promise.all(
-    attachments.map((attachment) =>
-      readAttachment(attachment as { displayName?: string; path?: string; filePath?: string }),
-    ),
-  );
-}
-
-// ============================================================================
 // Server Functions
 // ============================================================================
 
@@ -121,7 +90,7 @@ export type SessionsState = {
   worktrees: Record<string, SessionWorktree>;
 };
 
-/** Fetch list + streaming + unread + app metadata in a single round-trip */
+/** Fetch list + streaming + unread state in a single round-trip */
 export const getSessionsState = createServerFn({ method: "GET" })
   .inputValidator(zodValidator(sessionsStateInputSchema))
   .handler(async ({ data }): Promise<SessionsState> => {
@@ -129,19 +98,49 @@ export const getSessionsState = createServerFn({ method: "GET" })
       markSessionRead(sessionId);
     }
 
-    const [sessions, worktrees] = await Promise.all([listAllSessions(), getAllSessionWorktrees()]);
+    // If agent config is not set yet, return empty state gracefully
+    if (!hasAgentConfig()) {
+      return {
+        sessions: [],
+        streamingSessionIds: SessionStream.getRunningSessionIds(),
+        unreadSessionIds: getUnreadSessionIds(),
+        worktrees: {},
+      };
+    }
+
+    const config = getAgentConfig();
+    const [platformSessions, metadataStore] = await Promise.all([
+      listSessions(config, { order: "desc" }),
+      getSessionMetadataStore(),
+    ]);
+
+    // Map platform sessions to SessionMetadata, enriching with local summaries
+    const localMetadata = await metadataStore.getByIds(
+      platformSessions.data.map((s) => s.agent_session_id),
+    );
+
+    const sessions: SessionMetadata[] = platformSessions.data.map((ps) => {
+      const local = localMetadata.get(ps.agent_session_id);
+      return {
+        sessionId: ps.agent_session_id,
+        startTime: new Date(ps.created_at * 1000),
+        modifiedTime: new Date(ps.last_accessed_at * 1000),
+        summary: local?.summary ?? "",
+        isRemote: true,
+      };
+    });
 
     return {
       sessions,
       streamingSessionIds: SessionStream.getRunningSessionIds(),
       unreadSessionIds: getUnreadSessionIds(),
-      worktrees,
+      worktrees: {},
     };
   });
 
 /** Mark a session as read */
 export const markSessionAsRead = createServerFn({ method: "POST" })
-  .middleware([withSessionId])
+  .inputValidator(zodValidator(sessionInputSchema))
   .handler(async ({ data }) => {
     markSessionRead(data.sessionId);
     return { success: true };
@@ -149,98 +148,121 @@ export const markSessionAsRead = createServerFn({ method: "POST" })
 
 /** Mark a session as unread */
 export const markSessionAsUnread = createServerFn({ method: "POST" })
-  .middleware([withSessionId])
+  .inputValidator(zodValidator(sessionInputSchema))
   .handler(async ({ data }) => {
+    const { markSessionUnread } = await import("./state/unread");
     markSessionUnread(data.sessionId);
     return { success: true };
   });
 
-/** List available models */
+/** List available models from the remote hosted agent */
 export const listModels = createServerFn({ method: "GET" }).handler(
   async (): Promise<ModelInfo[]> => {
-    return listAvailableModels();
+    if (!hasAgentConfig()) return [];
+    try {
+      const config = getAgentConfig();
+      const { getAuthToken } = await import("./remote/auth");
+      const token = await getAuthToken();
+
+      const url = new URL(`${config.agentBaseUrl}/endpoint/protocols/invocations`);
+      url.searchParams.set("api-version", config.apiVersion);
+
+      const response = await fetch(url.toString(), {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+          "Foundry-Features": "HostedAgents=V1Preview",
+        },
+        body: JSON.stringify({ action: "list_models" }),
+      });
+
+      if (response.ok) {
+        const data = await response.json();
+        if (data.models && Array.isArray(data.models)) {
+          return data.models as ModelInfo[];
+        }
+      }
+    } catch (error) {
+      console.error("Failed to list models from remote agent:", error);
+    }
+    return [];
   },
 );
 
-/** List user-invocable skills for a session (directory-scoped, cached on client by CWD) */
+/** List user-invocable skills — not available for remote agents */
 export const listSessionSkills = createServerFn({ method: "POST" })
-  .middleware([withSessionId])
-  .handler(async ({ data }): Promise<SessionSkill[]> => {
-    const session = await getCachedOrResumeSession(data.sessionId);
-    const result = await session.rpc.skills.list();
-    return result.skills
-      .filter((s) => s.userInvocable && s.enabled)
-      .map((s) => ({ name: s.name, description: s.description }));
+  .inputValidator(zodValidator(sessionInputSchema))
+  .handler(async (): Promise<SessionSkill[]> => {
+    return [];
   });
 
-/**
- * When merging SDK history with streaming data, the SDK may already include
- * events from the in-progress turn (user message, completed sub-turn messages).
- * The streaming snapshot/buffer covers that same turn, so we truncate the
- * history at the turn boundary to avoid duplicating messages.
- */
-function truncateAtCurrentTurn(
-  historyMessages: Message[],
-  streamingMessages: Message[],
-): Message[] {
-  if (streamingMessages.length === 0 || streamingMessages[0].role !== "user") {
-    return historyMessages;
-  }
-
-  let lastUserIdx = -1;
-  for (let i = historyMessages.length - 1; i >= 0; i--) {
-    if (historyMessages[i].role === "user") {
-      lastUserIdx = i;
-      break;
-    }
-  }
-  if (lastUserIdx < 0) return historyMessages;
-  return historyMessages.slice(0, lastUserIdx);
-}
-
-/** Resume a session and get its message history */
+/** Get session snapshot — combines all run history with live stream state */
 export const querySession = createServerFn({ method: "POST" })
-  .middleware([withSessionId])
+  .inputValidator(zodValidator(sessionInputSchema))
   .handler(async ({ data }): Promise<SessionSnapshot> => {
-    const { session, events } = await getOrResumeSession(data.sessionId);
+    // Load prior run history from SQLite if not yet in memory
+    await loadHistoryFromSqlite(data.sessionId);
 
-    const sessionState = createInitialSession();
-    for await (const event of projectSessionEventsFromSdkHistory(events, {
-      resolveAttachments: ({ data }) => readHistoryAttachments(data?.attachments),
-    })) {
-      applySessionEvent(sessionState, event);
-    }
+    // Get all completed run messages with separators
+    const historyMessages = getAllMessagesWithSeparators(data.sessionId);
 
+    // Active stream — merge history with live state
     const stream = SessionStream.get(data.sessionId);
     const streamState = stream?.getTurnState();
 
-    let messages = sessionState.messages;
-    let model = sessionState.model;
-    let streamingTodos = sessionState.todos;
-    let status: SessionStatus = sessionState.status;
-    let reasoningContent = "";
     if (streamState) {
-      messages = truncateAtCurrentTurn(messages, streamState.messages);
-      messages = [...messages, ...streamState.messages];
-      model = streamState.model ?? model;
-      streamingTodos = streamState.todos ?? streamingTodos;
-      status = streamState.status;
-      reasoningContent = streamState.reasoningContent;
+      // Add separator if there's history before the live run
+      const separator: Message[] =
+        historyMessages.length > 0
+          ? [{ role: "assistant", content: "---\n\n**Previous run ended**\n\n---" }]
+          : [];
+
+      return {
+        id: data.sessionId,
+        messages: [...historyMessages, ...separator, ...streamState.messages],
+        queuedMessages: stream?.getQueuedMessages() ?? [],
+        model: streamState.model,
+        todos: streamState.todos,
+        lastSeenEventId: stream?.getLastEventId(),
+        status: streamState.status,
+        reasoningContent: streamState.reasoningContent,
+      };
     }
 
-    // Queued messages are stored on the stream (not in SDK event history)
-    // so they can survive client navigation and be cancelled by the user.
-    const queuedMessages = stream?.getQueuedMessages() ?? [];
+    // No active stream — check for just-completed state
+    const completedState = getLastCompletedState(data.sessionId);
+    if (completedState && historyMessages.length === 0) {
+      // Only the latest run, no prior history
+      return {
+        id: data.sessionId,
+        messages: completedState.messages,
+        queuedMessages: [],
+        model: completedState.model,
+        todos: completedState.todos,
+        status: "idle",
+        reasoningContent: "",
+      };
+    }
 
+    // Return all historical messages (includes the latest completed run)
+    if (historyMessages.length > 0) {
+      return {
+        id: data.sessionId,
+        messages: historyMessages,
+        queuedMessages: [],
+        status: "idle",
+        reasoningContent: "",
+      };
+    }
+
+    // No history at all — return empty snapshot
     return {
-      id: session.sessionId,
-      messages,
-      queuedMessages,
-      model,
-      todos: streamingTodos,
-      lastSeenEventId: stream?.getLastEventId(),
-      status,
-      reasoningContent,
+      id: data.sessionId,
+      messages: [],
+      queuedMessages: [],
+      status: "idle",
+      reasoningContent: "",
     };
   });
 
@@ -271,8 +293,7 @@ export const connectSessionStream = createServerFn({ method: "POST" })
     return new RawStream(createEventByteStream(iterator), { hint: "text" });
   });
 
-/** Enqueue a message to be sent after the current turn finishes.
- *  Stored on the stream so it survives client navigation and can be cancelled. */
+/** Enqueue a message to be sent after the current turn finishes. */
 export const enqueueMessage = createServerFn({ method: "POST" })
   .inputValidator(zodValidator(enqueueInputSchema))
   .handler(async ({ data }) => {
@@ -288,7 +309,7 @@ export const enqueueMessage = createServerFn({ method: "POST" })
     return { success: true };
   });
 
-/** Cancel a queued message by ID (before it's been sent to the SDK) */
+/** Cancel a queued message by ID */
 export const cancelQueuedMessage = createServerFn({ method: "POST" })
   .inputValidator(zodValidator(cancelQueuedInputSchema))
   .handler(async ({ data }) => {
@@ -297,10 +318,9 @@ export const cancelQueuedMessage = createServerFn({ method: "POST" })
     return { success: removed };
   });
 
-/** Abort the currently processing message in a session.
- *  Closes the stream (which clears buffer, queue, and SDK listener). */
+/** Abort the currently processing message in a session. */
 export const abortSession = createServerFn({ method: "POST" })
-  .middleware([withSessionId])
+  .inputValidator(zodValidator(sessionInputSchema))
   .handler(async ({ data }) => {
     const stream = SessionStream.get(data.sessionId);
     if (stream) {
@@ -311,53 +331,19 @@ export const abortSession = createServerFn({ method: "POST" })
 
 /** Destroy a session and release resources */
 export const destroySession = createServerFn({ method: "POST" })
-  .middleware([withSessionId])
+  .inputValidator(zodValidator(sessionInputSchema))
   .handler(async ({ data }) => {
     SessionStream.close(data.sessionId);
     await deleteSession(data.sessionId);
     return { success: true };
   });
 
-/**
- * Resolve and validate a worktree session's metadata + git root, then run the
- * given callback. Returns `{ status: "no-worktree" }` if the session has no
- * worktree. On success, cleans up the worktree automatically.
- */
-async function withWorktreeSession<T extends { status: string }>(
-  sessionId: string,
-  action: (gitRoot: string, info: { branch: string; baseBranch: string }) => Promise<T>,
-  successStatus: T["status"],
-): Promise<T | { status: "no-worktree" }> {
-  const worktree = await getSessionWorktree(sessionId);
-  if (!worktree?.path || !worktree.branch || !worktree.baseBranch) {
-    return { status: "no-worktree" as const };
-  }
-  const gitRoot = await detectGitRoot(worktree.path);
-  if (!gitRoot) return { status: "no-worktree" as const };
-
-  const result = await action(gitRoot, {
-    branch: worktree.branch,
-    baseBranch: worktree.baseBranch,
-  });
-
-  // Clean up the worktree + record after a successful operation
-  if (result.status === successStatus) {
-    await cleanupWorktree({
-      path: worktree.path,
-      branch: worktree.branch,
-    }).catch(console.error);
-    await deleteSessionWorktree(sessionId);
-  }
-
-  return result;
-}
-
-/** Merge a worktree session's changes back into its base branch */
+/** Merge a worktree session — not available for remote agents */
 export const mergeSessionWorktree = createServerFn({ method: "POST" })
-  .middleware([withSessionId])
-  .handler(async ({ data }) => withWorktreeSession(data.sessionId, mergeWorktreeBranch, "merged"));
+  .inputValidator(zodValidator(sessionInputSchema))
+  .handler(async () => ({ status: "no-worktree" as const }));
 
-/** Apply a worktree session's changes to its base branch as uncommitted modifications */
+/** Apply a worktree session — not available for remote agents */
 export const applySessionWorktree = createServerFn({ method: "POST" })
-  .middleware([withSessionId])
-  .handler(async ({ data }) => withWorktreeSession(data.sessionId, applyWorktreeBranch, "applied"));
+  .inputValidator(zodValidator(sessionInputSchema))
+  .handler(async () => ({ status: "no-worktree" as const }));

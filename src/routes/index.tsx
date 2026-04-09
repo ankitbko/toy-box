@@ -1,27 +1,26 @@
 import { useHotkey } from "@tanstack/react-hotkeys";
-import { createFileRoute, useNavigate, ClientOnly } from "@tanstack/react-router";
+import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { zodValidator } from "@tanstack/zod-adapter";
-import { useState, useMemo, useRef, useEffect, useCallback, lazy, Suspense } from "react";
+import { useState, useMemo, useRef, useEffect, useCallback } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { z } from "zod";
 import type { ImperativePanelHandle } from "react-resizable-panels";
 import { PanelLeft } from "lucide-react";
 import { ResizablePanelGroup, ResizablePanel, ResizableHandle } from "@/components/ui/resizable";
 import { destroySession } from "@/functions/sessions";
-import { getRuntimeConfig } from "@/functions/config";
+import { getRuntimeConfig, setAgentUrl } from "@/functions/config";
 import { modelQueries } from "@/lib/queries";
+import { getSettings } from "@/lib/settings";
 import { useAutomations } from "@/hooks/automations/useAutomations";
 import { useLocalStorage } from "@/hooks/browser/useLocalStorage";
 import { useSessions } from "@/hooks/session/useSessions";
 import { useViewport } from "@/hooks/browser/ViewportContext";
-import { usePanelTransition } from "@/hooks/browser/usePanelTransition";
 import { generateUUID } from "@/lib/utils";
 import type { SessionMetadata } from "@/types";
 import { Sidebar, SidebarProps } from "@/components/sidebar/Sidebar";
 import { SessionView } from "@/components/session/SessionView";
 import { SessionGrid } from "@/components/session/SessionGrid";
 import { SessionPlaceholder } from "@/components/session/SessionPlaceholder";
-import { TerminalShell } from "@/components/terminal/TerminalShell";
 import {
   normalizeSessionDirectoryOptions,
   type SessionDirectoryOption,
@@ -33,8 +32,6 @@ import {
   resolveLayoutPrefs,
   SIDEBAR_OPEN_COOKIE,
   SIDEBAR_SIZE_COOKIE,
-  TERMINAL_OPEN_COOKIE,
-  TERMINAL_SIZE_COOKIE,
 } from "@/lib/config/layoutPrefs";
 import {
   cancelSessionsState,
@@ -43,9 +40,6 @@ import {
   removeSessionFromState,
   replaceSessionsState,
 } from "@/lib/session/sessionsCache";
-const Terminal = lazy(() =>
-  import("@/components/terminal/Terminal").then((m) => ({ default: m.Terminal })),
-);
 
 /** Session ID prefix for sessions created by this web app */
 const SESSION_ID_PREFIX = "toy-box-";
@@ -59,28 +53,23 @@ const searchSchema = z.object({
 
 export const Route = createFileRoute("/")({
   validateSearch: zodValidator(searchSchema),
-  loader: async () => loadLayoutPrefs(),
+  loader: async () => {
+    const [layoutPrefs, runtimeConfig] = await Promise.all([loadLayoutPrefs(), getRuntimeConfig()]);
+    return { ...layoutPrefs, runtimeConfig };
+  },
   component: SessionsPage,
 });
 
 const EMPTY_SESSION_IDS: string[] = [];
 
 async function loadLayoutPrefs() {
-  const runtimeConfig = await getRuntimeConfig();
-
   if (import.meta.env.SSR) {
     const { getRequestHeader } = await import("@tanstack/react-start/server");
     const cookieHeader = getRequestHeader("cookie") ?? getRequestHeader("Cookie");
-    return {
-      ...resolveLayoutPrefs(parseLayoutPrefs(cookieHeader)),
-      terminalWsPort: runtimeConfig.terminalWsPort,
-    };
+    return resolveLayoutPrefs(parseLayoutPrefs(cookieHeader));
   }
 
-  return {
-    ...resolveLayoutPrefs(parseLayoutPrefs(document.cookie)),
-    terminalWsPort: runtimeConfig.terminalWsPort,
-  };
+  return resolveLayoutPrefs(parseLayoutPrefs(document.cookie));
 }
 
 function SessionsPage() {
@@ -90,14 +79,28 @@ function SessionsPage() {
   const sessionIds = search?.sessionIds ?? EMPTY_SESSION_IDS;
   const {
     sidebarSize: initialSidebarSize,
-    terminalSize: initialTerminalSize,
     sidebarOpen: initialSidebarOpen,
-    terminalOpen: initialTerminalOpen,
     automationsExpanded: initialAutomationsExpanded,
-    terminalWsPort,
+    runtimeConfig,
   } = Route.useLoaderData();
 
-  const { allSessions, sessions, isLoading, streamingSessionIds, unreadSessionIds, worktreeSessionIds } = useSessions({
+  // Bootstrap agent URL on load: settings override > env fallback
+  useEffect(() => {
+    const settings = getSettings();
+    const effectiveUrl = settings.agentBaseUrl || runtimeConfig?.agentBaseUrl;
+    if (effectiveUrl) {
+      setAgentUrl({ data: { agentBaseUrl: effectiveUrl } });
+    }
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const {
+    allSessions,
+    sessions,
+    isLoading,
+    streamingSessionIds,
+    unreadSessionIds,
+    worktreeSessionIds,
+  } = useSessions({
     openSessionIds: sessionIds,
   });
   const {
@@ -137,19 +140,13 @@ function SessionsPage() {
       setSelectedModel(models[0].id);
     }
   }, [models, selectedModel, setSelectedModel]);
+
   const [sidebarSize, setSidebarSize] = useState(initialSidebarSize);
-  const [terminalSize, setTerminalSize] = useState(initialTerminalSize);
   const [isSidebarOpen, setIsSidebarOpen] = useState(initialSidebarOpen);
 
-  // Terminal state - synced with cookie (SSR-safe)
-  const [isTerminalOpen, setIsTerminalOpen] = useState(initialTerminalOpen);
   const [isAutomationsExpanded, setIsAutomationsExpanded] = useState(initialAutomationsExpanded);
-  const terminalPanelRef = useRef<ImperativePanelHandle>(null);
 
   const { isMobile: isMobileLayout, hydrated } = useViewport();
-  const shouldRenderMobileTerminalShell = import.meta.env.SSR
-    ? initialTerminalOpen
-    : isTerminalOpen;
 
   // Draft session state - tracks a session that hasn't been created on the server yet
   const [draftSessionId, setDraftSessionId] = useState<string | null>(null);
@@ -240,35 +237,9 @@ function SessionsPage() {
   const [deletingSessionId, setDeletingSessionId] = useState<string | null>(null);
   const [filter, setFilter] = useState("");
   const [isSidebarDragging, setIsSidebarDragging] = useState(false);
-  const [isTerminalDragging, setIsTerminalDragging] = useState(false);
   const sidebarPanelRef = useRef<ImperativePanelHandle>(null);
   const sidebarSizeRef = useRef(sidebarSize);
-  const terminalSizeRef = useRef(terminalSize);
   const isSidebarDraggingRef = useRef(false);
-  const isTerminalDraggingRef = useRef(false);
-
-  // Keep terminal mounted during close animation for smooth transition.
-  const [isTerminalMounted, setIsTerminalMounted] = useState(isTerminalOpen);
-  const isTerminalAnimating = usePanelTransition("terminal", isTerminalOpen);
-  useEffect(() => {
-    if (isTerminalOpen) {
-      setIsTerminalMounted(true);
-    } else if (!isTerminalAnimating) {
-      setIsTerminalMounted(false);
-    }
-  }, [isTerminalOpen, isTerminalAnimating]);
-
-  // Animate terminal panel open/close (mirrors SessionGrid's useEffect pattern)
-  useEffect(() => {
-    const panel = terminalPanelRef.current;
-    if (!panel) return;
-    if (isTerminalOpen) {
-      if (!Number.isFinite(terminalSize)) return;
-      panel.resize(terminalSize);
-    } else {
-      panel.resize(0);
-    }
-  }, [isTerminalOpen, terminalSize]);
 
   useEffect(() => {
     sidebarSizeRef.current = sidebarSize;
@@ -282,19 +253,6 @@ function SessionsPage() {
     if (!Number.isFinite(sidebarSize)) return;
     document.cookie = buildLayoutCookie(SIDEBAR_SIZE_COOKIE, sidebarSize);
   }, [sidebarSize]);
-
-  useEffect(() => {
-    terminalSizeRef.current = terminalSize;
-  }, [terminalSize]);
-
-  useEffect(() => {
-    document.cookie = buildLayoutCookie(TERMINAL_OPEN_COOKIE, isTerminalOpen);
-  }, [isTerminalOpen]);
-
-  useEffect(() => {
-    if (!Number.isFinite(terminalSize)) return;
-    document.cookie = buildLayoutCookie(TERMINAL_SIZE_COOKIE, terminalSize);
-  }, [terminalSize]);
 
   useEffect(() => {
     document.cookie = buildLayoutCookie(AUTOMATIONS_EXPANDED_COOKIE, isAutomationsExpanded);
@@ -312,18 +270,6 @@ function SessionsPage() {
     [setSidebarSize],
   );
 
-  const handleTerminalResize = useCallback(
-    (size: number) => {
-      if (size > 0) {
-        terminalSizeRef.current = size;
-        if (!isTerminalDraggingRef.current) {
-          setTerminalSize(size);
-        }
-      }
-    },
-    [setTerminalSize],
-  );
-
   const handleSidebarDragging = useCallback(
     (dragging: boolean) => {
       isSidebarDraggingRef.current = dragging;
@@ -334,20 +280,6 @@ function SessionsPage() {
     },
     [setSidebarSize],
   );
-
-  const handleTerminalDragging = useCallback(
-    (dragging: boolean) => {
-      isTerminalDraggingRef.current = dragging;
-      setIsTerminalDragging(dragging);
-      if (!dragging) {
-        setTerminalSize(terminalSizeRef.current);
-      }
-    },
-    [setTerminalSize],
-  );
-
-  // Pause PTY resize during sidebar open/close animation
-  const isSidebarAnimating = usePanelTransition("sidebar", isSidebarOpen);
 
   const isCollapsed = !isSidebarOpen;
 
@@ -379,30 +311,9 @@ function SessionsPage() {
     }
   };
 
-  const toggleTerminal = useCallback(() => {
-    setIsTerminalOpen((prev) => !prev);
-  }, []);
-
   // Global keyboard shortcuts
   useHotkey("Mod+B", toggleSidebar);
   useHotkey({ key: "N", ctrl: true }, () => handleCreateSession());
-  useHotkey({ key: "`", ctrl: true }, toggleTerminal);
-
-  const handleTerminalClose = useCallback(() => {
-    if (typeof window !== "undefined") {
-      void import("@/lib/terminal/terminalManager").then(({ terminalManager }) => {
-        terminalManager.close();
-      });
-    }
-    setIsTerminalOpen(false);
-  }, []);
-
-  const handleTerminalQuickKey = useCallback((data: string) => {
-    if (typeof window === "undefined") return;
-    void import("@/lib/terminal/terminalManager").then(({ terminalManager }) => {
-      terminalManager.sendInput(data);
-    });
-  }, []);
 
   // Hide reusable automation sessions from the main session list, then apply source/text filters.
   const filteredSessions = useMemo(() => {
@@ -520,12 +431,8 @@ function SessionsPage() {
 
   const hasSelectedSession = sessionIds.length > 0;
 
-  // Mobile view state: 'sidebar' | 'session' | 'terminal'
-  type MobileView = "sidebar" | "session" | "terminal";
-  const baseMobileView: Exclude<MobileView, "terminal"> = hasSelectedSession
-    ? "session"
-    : "sidebar";
-  const mobileView: MobileView = isTerminalOpen ? "terminal" : baseMobileView;
+  // Mobile view state: 'sidebar' | 'session'
+  const baseMobileView = hasSelectedSession ? "session" : "sidebar";
   const mobileTrackIndex = baseMobileView === "sidebar" ? 0 : 1;
   const mobileContainerRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
@@ -533,28 +440,6 @@ function SessionsPage() {
       mobileContainerRef.current.scrollLeft = 0;
     }
   }, [baseMobileView]);
-
-  const terminalBodySkeleton = (
-    <div className="relative flex-1 min-h-0 p-2 pb-0">
-      <div className="h-5 w-75 max-w-full rounded-md bg-white/5 animate-pulse" />
-    </div>
-  );
-
-  // Suppress PTY resize during any panel drag or animated open/close
-  const isPanelTransitioning =
-    isSidebarDragging || isTerminalDragging || isSidebarAnimating || isTerminalAnimating;
-
-  const terminalBody = (
-    <ClientOnly fallback={terminalBodySkeleton}>
-      <Suspense fallback={terminalBodySkeleton}>
-        <Terminal
-          onClose={handleTerminalClose}
-          isResizing={isPanelTransitioning}
-          wsPort={terminalWsPort}
-        />
-      </Suspense>
-    </ClientOnly>
-  );
 
   // Shared sidebar props for both mobile and desktop
   const sidebarProps = {
@@ -591,11 +476,9 @@ function SessionsPage() {
     deletingAutomationId,
     runningAutomationIds,
     onCreateSession: handleCreateSession,
-    onToggleTerminal: toggleTerminal,
-    isTerminalOpen,
   } as SidebarProps;
 
-  // Mobile layout - three views: sidebar, session, terminal
+  // Mobile layout - sidebar and session views
   const mobileLayout = (
     <div ref={mobileContainerRef} className="relative h-full md:hidden overflow-hidden">
       {/* Slide track - shifts between sidebar and session */}
@@ -622,22 +505,6 @@ function SessionsPage() {
               draftSessionId={draftSessionId}
               onDraftSessionCreated={handleDraftSessionCreated}
             />
-          )}
-        </div>
-      </div>
-
-      {/* Terminal overlay (separate layer to avoid transform on input) */}
-      <div
-        className={`absolute inset-y-0 w-full ${
-          hydrated ? "transition-[left] duration-300 ease-in-out" : ""
-        } ${mobileView === "terminal" ? "pointer-events-auto" : "pointer-events-none"}`}
-        style={{ left: mobileView === "terminal" ? "0%" : "100%" }}
-      >
-        <div className="h-full">
-          {shouldRenderMobileTerminalShell && (
-            <TerminalShell onClose={handleTerminalClose} onQuickKey={handleTerminalQuickKey}>
-              {isMobileLayout ? terminalBody : terminalBodySkeleton}
-            </TerminalShell>
           )}
         </div>
       </div>
@@ -673,75 +540,45 @@ function SessionsPage() {
           className={isCollapsed ? "hidden" : ""}
         />
 
-        {/* Right Panel - Chat View + Terminal */}
+        {/* Right Panel - Chat View */}
         <ResizablePanel
           order={2}
           defaultSize={isSidebarOpen ? 100 - sidebarSize : 100}
           className={!isSidebarDragging ? "panel-transition" : ""}
         >
-          <ResizablePanelGroup direction="vertical" className="h-full">
-            {/* Main content area - Chat sessions */}
-            <ResizablePanel order={1} defaultSize={isTerminalOpen ? 100 - terminalSize : 100}>
-              <div className="h-full overflow-hidden relative">
-                {/* Expand button when collapsed */}
-                {showExpandButton && (
-                  <button
-                    onClick={toggleSidebar}
-                    className="absolute top-3 left-3 z-10 text-muted-foreground hover:text-foreground"
-                    aria-label="Expand sidebar"
-                  >
-                    <PanelLeft className="h-5 w-5" />
-                  </button>
-                )}
-                {sessionIds.length > 0 ? (
-                  <SessionGrid
-                    sessionIds={sessionIds}
-                    streamingSessionIds={streamingSessionIds}
-                    unreadSessionIds={unreadSessionIds}
-                    onRemoveSession={(sessionIdToRemove) => {
-                      const updated = sessionIds.filter((id) => id !== sessionIdToRemove);
-                      navigate({
-                        to: "/",
-                        search: updated.length > 0 ? { sessionIds: updated } : {},
-                      });
-                    }}
-                    models={models}
-                    selectedModel={selectedModel}
-                    onModelChange={setSelectedModel}
-                    draftSessionId={draftSessionId}
-                    onDraftSessionCreated={handleDraftSessionCreated}
-                  />
-                ) : (
-                  <SessionPlaceholder />
-                )}
-              </div>
-            </ResizablePanel>
-
-            {/* Terminal drawer (collapsible from bottom) */}
-            <ResizableHandle onDragging={handleTerminalDragging} />
-            <ResizablePanel
-              ref={terminalPanelRef}
-              id="terminal"
-              order={2}
-              defaultSize={isTerminalOpen ? terminalSize : 0}
-              minSize={15}
-              maxSize={80}
-              collapsible
-              collapsedSize={0}
-              onResize={handleTerminalResize}
-              onCollapse={() => setIsTerminalOpen(false)}
-              onExpand={() => setIsTerminalOpen(true)}
-              className={!isTerminalDragging ? "panel-transition" : ""}
-            >
-              {isTerminalMounted && (
-                <div className="h-full border-t">
-                  <TerminalShell onClose={handleTerminalClose} onQuickKey={handleTerminalQuickKey}>
-                    {!isMobileLayout ? terminalBody : terminalBodySkeleton}
-                  </TerminalShell>
-                </div>
-              )}
-            </ResizablePanel>
-          </ResizablePanelGroup>
+          <div className="h-full overflow-hidden relative">
+            {/* Expand button when collapsed */}
+            {showExpandButton && (
+              <button
+                onClick={toggleSidebar}
+                className="absolute top-3 left-3 z-10 text-muted-foreground hover:text-foreground"
+                aria-label="Expand sidebar"
+              >
+                <PanelLeft className="h-5 w-5" />
+              </button>
+            )}
+            {sessionIds.length > 0 ? (
+              <SessionGrid
+                sessionIds={sessionIds}
+                streamingSessionIds={streamingSessionIds}
+                unreadSessionIds={unreadSessionIds}
+                onRemoveSession={(sessionIdToRemove) => {
+                  const updated = sessionIds.filter((id) => id !== sessionIdToRemove);
+                  navigate({
+                    to: "/",
+                    search: updated.length > 0 ? { sessionIds: updated } : {},
+                  });
+                }}
+                models={models}
+                selectedModel={selectedModel}
+                onModelChange={setSelectedModel}
+                draftSessionId={draftSessionId}
+                onDraftSessionCreated={handleDraftSessionCreated}
+              />
+            ) : (
+              <SessionPlaceholder />
+            )}
+          </div>
         </ResizablePanel>
       </ResizablePanelGroup>
     </div>

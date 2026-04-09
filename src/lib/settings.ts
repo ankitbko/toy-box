@@ -4,48 +4,19 @@
 // independently via updateSetting() — no save button needed.
 
 export type Settings = {
-  terminalShell: string;
+  agentBaseUrl: string;
   useWorktree: boolean;
 };
 
 const STORAGE_KEY = "toybox_settings";
 
 const DEFAULTS: Settings = {
-  terminalShell: "",
+  agentBaseUrl: "",
   useWorktree: false,
 };
 
-const LEGACY_TERMINAL_SHELL_KEY = "toybox_terminal_shell";
-
-function migrateLegacySettings(): void {
-  try {
-    const legacyShell = window.localStorage.getItem(LEGACY_TERMINAL_SHELL_KEY);
-    if (legacyShell === null) return;
-    const trimmed = legacyShell.trim();
-    if (trimmed.length > 0) {
-      const current = window.localStorage.getItem(STORAGE_KEY);
-      const parsed = current ? JSON.parse(current) : {};
-      if (!parsed.terminalShell) {
-        window.localStorage.setItem(
-          STORAGE_KEY,
-          JSON.stringify({ ...parsed, terminalShell: trimmed }),
-        );
-      }
-    }
-    window.localStorage.removeItem(LEGACY_TERMINAL_SHELL_KEY);
-  } catch {
-    // Ignore migration errors
-  }
-}
-
-let migrated = false;
-
 export function getSettings(): Settings {
   if (typeof window === "undefined") return DEFAULTS;
-  if (!migrated) {
-    migrated = true;
-    migrateLegacySettings();
-  }
   try {
     const raw = window.localStorage.getItem(STORAGE_KEY);
     if (!raw) return DEFAULTS;

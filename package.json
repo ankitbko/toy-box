@@ -19,7 +19,7 @@
     "access": "public"
   },
   "scripts": {
-    "dev": "concurrently --kill-others --names \"app,ws\" --prefix-colors \"blue,green\" \"TERMINAL_WS_PORT=3101 vite dev --port 3100\" \"TERMINAL_WS_PORT=3101 bun run terminal-server/index.ts\"",
+    "dev": "vite dev --port 3100",
     "build": "vite build",
     "build:cli": "bun run build && bun build --compile --target=bun-darwin-arm64 ./cli/index.ts --outfile toy-box",
     "check": "tsc --noEmit",
@@ -31,7 +31,6 @@
     "cmdk": "^1.1.1"
   },
   "devDependencies": {
-    "@github/copilot-sdk": "0.2.0",
     "@radix-ui/react-alert-dialog": "^1.1.15",
     "@radix-ui/react-dialog": "^1.1.15",
     "@radix-ui/react-dropdown-menu": "^2.1.16",
@@ -66,7 +65,6 @@
     "citty": "^0.2.1",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
-    "concurrently": "^9.2.1",
     "cron-parser": "^5.5.0",
     "db0": "^0.3.4",
     "lefthook": "^2.1.4",
