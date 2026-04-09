@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { Link } from "@tanstack/react-router";
-import { Settings } from "lucide-react";
+import { Settings, ScrollText } from "lucide-react";
 import { Separator } from "@/components/ui/separator";
 import { Input } from "@/components/ui/input";
 import {
@@ -13,7 +13,12 @@ import {
 import { getSettings, updateSetting } from "@/lib/settings";
 import { setAgentUrl } from "@/functions/config";
 
-export function SidebarFooter() {
+export interface SidebarFooterProps {
+  onToggleLogs?: () => void;
+  isLogsOpen?: boolean;
+}
+
+export function SidebarFooter({ onToggleLogs, isLogsOpen }: SidebarFooterProps) {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [agentBaseUrl, setAgentBaseUrl] = useState("");
 
@@ -44,6 +49,16 @@ export function SidebarFooter() {
               <Settings className="h-4 w-4" />
             </button>
           </DialogTrigger>
+          {onToggleLogs && (
+            <button
+              onClick={onToggleLogs}
+              className={`transition-colors ${isLogsOpen ? "text-foreground" : "text-muted-foreground hover:text-foreground"}`}
+              aria-label="Toggle logs"
+              aria-pressed={isLogsOpen}
+            >
+              <ScrollText className="h-4 w-4" />
+            </button>
+          )}
           <Separator
             orientation="vertical"
             className="h-4! w-px! bg-muted-foreground/50! mx-1 translate-y-px"

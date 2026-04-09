@@ -51,6 +51,10 @@ export interface SidebarProps {
   // Shell props (desktop only)
   onCollapse?: () => void;
 
+  // Logs panel props
+  onToggleLogs?: () => void;
+  isLogsOpen?: boolean;
+
   // Styling
   className?: string;
 }
@@ -97,6 +101,10 @@ export function Sidebar({
 
   // Shell props
   onCollapse,
+
+  // Logs panel props
+  onToggleLogs,
+  isLogsOpen,
 
   // Styling
   className,
@@ -156,7 +164,7 @@ export function Sidebar({
         />
       </div>
 
-      <SidebarFooter />
+      <SidebarFooter onToggleLogs={onToggleLogs} isLogsOpen={isLogsOpen} />
     </div>
   );
 }

@@ -21,12 +21,15 @@ import { Sidebar, SidebarProps } from "@/components/sidebar/Sidebar";
 import { SessionView } from "@/components/session/SessionView";
 import { SessionGrid } from "@/components/session/SessionGrid";
 import { SessionPlaceholder } from "@/components/session/SessionPlaceholder";
+import { LogPanel } from "@/components/logs/LogPanel";
 import {
   normalizeSessionDirectoryOptions,
   type SessionDirectoryOption,
 } from "@/components/session/sessionDirectoryOptions";
 import {
   AUTOMATIONS_EXPANDED_COOKIE,
+  LOGS_OPEN_COOKIE,
+  LOGS_SIZE_COOKIE,
   buildLayoutCookie,
   parseLayoutPrefs,
   resolveLayoutPrefs,
@@ -81,6 +84,8 @@ function SessionsPage() {
     sidebarSize: initialSidebarSize,
     sidebarOpen: initialSidebarOpen,
     automationsExpanded: initialAutomationsExpanded,
+    logsOpen: initialLogsOpen,
+    logsSize: initialLogsSize,
     runtimeConfig,
   } = Route.useLoaderData();
 
@@ -145,6 +150,9 @@ function SessionsPage() {
   const [isSidebarOpen, setIsSidebarOpen] = useState(initialSidebarOpen);
 
   const [isAutomationsExpanded, setIsAutomationsExpanded] = useState(initialAutomationsExpanded);
+
+  const [isLogsOpen, setIsLogsOpen] = useState(initialLogsOpen);
+  const [logsSize, setLogsSize] = useState(initialLogsSize);
 
   const { isMobile: isMobileLayout, hydrated } = useViewport();
 
@@ -258,6 +266,15 @@ function SessionsPage() {
     document.cookie = buildLayoutCookie(AUTOMATIONS_EXPANDED_COOKIE, isAutomationsExpanded);
   }, [isAutomationsExpanded]);
 
+  useEffect(() => {
+    document.cookie = buildLayoutCookie(LOGS_OPEN_COOKIE, isLogsOpen);
+  }, [isLogsOpen]);
+
+  useEffect(() => {
+    if (!Number.isFinite(logsSize)) return;
+    document.cookie = buildLayoutCookie(LOGS_SIZE_COOKIE, logsSize);
+  }, [logsSize]);
+
   const handleSidebarResize = useCallback(
     (size: number) => {
       if (size > 0) {
@@ -311,9 +328,14 @@ function SessionsPage() {
     }
   };
 
+  const toggleLogs = useCallback(() => {
+    setIsLogsOpen((prev) => !prev);
+  }, []);
+
   // Global keyboard shortcuts
   useHotkey("Mod+B", toggleSidebar);
   useHotkey({ key: "N", ctrl: true }, () => handleCreateSession());
+  useHotkey({ key: "L", ctrl: true }, toggleLogs);
 
   // Hide reusable automation sessions from the main session list, then apply source/text filters.
   const filteredSessions = useMemo(() => {
@@ -476,6 +498,8 @@ function SessionsPage() {
     deletingAutomationId,
     runningAutomationIds,
     onCreateSession: handleCreateSession,
+    onToggleLogs: toggleLogs,
+    isLogsOpen,
   } as SidebarProps;
 
   // Mobile layout - sidebar and session views
@@ -540,45 +564,68 @@ function SessionsPage() {
           className={isCollapsed ? "hidden" : ""}
         />
 
-        {/* Right Panel - Chat View */}
+        {/* Right Panel - Chat View + Logs */}
         <ResizablePanel
           order={2}
           defaultSize={isSidebarOpen ? 100 - sidebarSize : 100}
           className={!isSidebarDragging ? "panel-transition" : ""}
         >
-          <div className="h-full overflow-hidden relative">
-            {/* Expand button when collapsed */}
-            {showExpandButton && (
-              <button
-                onClick={toggleSidebar}
-                className="absolute top-3 left-3 z-10 text-muted-foreground hover:text-foreground"
-                aria-label="Expand sidebar"
+          <ResizablePanelGroup direction="vertical" className="h-full">
+            {/* Main content area */}
+            <ResizablePanel order={1} defaultSize={isLogsOpen ? 100 - logsSize : 100}>
+              <div className="h-full overflow-hidden relative">
+                {/* Expand button when collapsed */}
+                {showExpandButton && (
+                  <button
+                    onClick={toggleSidebar}
+                    className="absolute top-3 left-3 z-10 text-muted-foreground hover:text-foreground"
+                    aria-label="Expand sidebar"
+                  >
+                    <PanelLeft className="h-5 w-5" />
+                  </button>
+                )}
+                {sessionIds.length > 0 ? (
+                  <SessionGrid
+                    sessionIds={sessionIds}
+                    streamingSessionIds={streamingSessionIds}
+                    unreadSessionIds={unreadSessionIds}
+                    onRemoveSession={(sessionIdToRemove) => {
+                      const updated = sessionIds.filter((id) => id !== sessionIdToRemove);
+                      navigate({
+                        to: "/",
+                        search: updated.length > 0 ? { sessionIds: updated } : {},
+                      });
+                    }}
+                    models={models}
+                    selectedModel={selectedModel}
+                    onModelChange={setSelectedModel}
+                    draftSessionId={draftSessionId}
+                    onDraftSessionCreated={handleDraftSessionCreated}
+                  />
+                ) : (
+                  <SessionPlaceholder />
+                )}
+              </div>
+            </ResizablePanel>
+
+            {isLogsOpen && <ResizableHandle />}
+
+            {isLogsOpen && (
+              <ResizablePanel
+                order={2}
+                defaultSize={logsSize}
+                minSize={10}
+                maxSize={60}
+                onResize={setLogsSize}
               >
-                <PanelLeft className="h-5 w-5" />
-              </button>
+                <LogPanel
+                  sessionId={sessionIds[0] ?? null}
+                  isOpen={isLogsOpen}
+                  onToggle={toggleLogs}
+                />
+              </ResizablePanel>
             )}
-            {sessionIds.length > 0 ? (
-              <SessionGrid
-                sessionIds={sessionIds}
-                streamingSessionIds={streamingSessionIds}
-                unreadSessionIds={unreadSessionIds}
-                onRemoveSession={(sessionIdToRemove) => {
-                  const updated = sessionIds.filter((id) => id !== sessionIdToRemove);
-                  navigate({
-                    to: "/",
-                    search: updated.length > 0 ? { sessionIds: updated } : {},
-                  });
-                }}
-                models={models}
-                selectedModel={selectedModel}
-                onModelChange={setSelectedModel}
-                draftSessionId={draftSessionId}
-                onDraftSessionCreated={handleDraftSessionCreated}
-              />
-            ) : (
-              <SessionPlaceholder />
-            )}
-          </div>
+          </ResizablePanelGroup>
         </ResizablePanel>
       </ResizablePanelGroup>
     </div>
