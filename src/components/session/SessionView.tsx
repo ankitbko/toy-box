@@ -347,7 +347,7 @@ export function SessionView({
     ...sessionQueries.detail(sessionId),
     enabled: !isDraft && !isStreaming,
     staleTime: isAutomation ? 0 : Infinity,
-    refetchInterval: isAutomation && !isStreaming ? 10_000 : false,
+    refetchInterval: isAutomation && !isStreaming ? 5_000 : false,
   });
 
   // Skills are directory-scoped — fetch once per CWD, shared across sessions.
