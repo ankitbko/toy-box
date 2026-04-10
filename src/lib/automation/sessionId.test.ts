@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   createAutomationRunSessionId,
+  createAutomationReuseSessionId,
   getAutomationIdFromSessionId,
   isAutomationRunSession,
 } from "./sessionId";
@@ -15,12 +16,17 @@ describe("automation session IDs", () => {
     expect(isAutomationRunSession(sessionId)).toBe(true);
   });
 
+  test("encodes and decodes the automation ID for reuse sessions", () => {
+    const automationId = "automation-456";
+    const sessionId = createAutomationReuseSessionId(automationId);
+
+    expect(sessionId).toBe("toy-box-auto-automation-456");
+    expect(getAutomationIdFromSessionId(sessionId)).toBe(automationId);
+    expect(isAutomationRunSession(sessionId)).toBe(true);
+  });
+
   test("ignores non-automation session IDs", () => {
     expect(getAutomationIdFromSessionId("toy-box-abc")).toBeNull();
     expect(isAutomationRunSession("toy-box-abc")).toBe(false);
-  });
-
-  test("requires a run separator", () => {
-    expect(getAutomationIdFromSessionId("toy-box-auto-automation-123")).toBeNull();
   });
 });

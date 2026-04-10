@@ -45,7 +45,9 @@ export async function invokeAgent(
 
   if (!response.ok) {
     const errorText = await response.text();
-    throw new Error(`Invocation failed (${response.status}): ${errorText}`);
+    const message = `Invocation failed (${response.status}): ${errorText}`;
+    console.error(`[remote] ${message}`);
+    throw new Error(message);
   }
 
   if (!response.body) {

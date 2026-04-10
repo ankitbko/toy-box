@@ -6,13 +6,19 @@
 import { createSession, deleteSession, hasAgentConfig } from "@/functions/state/sessionCache";
 import { updateSessionSummary } from "@/functions/runtime/broadcast";
 import { SessionStream } from "@/functions/runtime/stream";
-import { createAutomationRunSessionId } from "@/lib/automation/sessionId";
+import {
+  createAutomationRunSessionId,
+  createAutomationReuseSessionId,
+} from "@/lib/automation/sessionId";
 import type { Automation } from "@/types";
 import { getAppDatabase } from "@/functions/database";
 import { AutomationDatabase } from "./database";
 import { emitAutomationsUpdate } from "./events";
 
 const AUTOMATION_SCHEDULER_POLL_MS = 30_000;
+
+/** Track in-flight automation invocations to prevent overlapping runs on the same session. */
+const runningAutomationSessions = new Set<string>();
 
 type AutomationSchedulerDependencies = {
   db: AutomationDatabase;
@@ -65,7 +71,11 @@ export async function runSchedulerTick() {
     console.log(`[scheduler] tick: ${dueAutomations.length} due automations`);
     for (const automation of dueAutomations) {
       try {
+        console.log(
+          `[scheduler] running automation ${automation.id} (session: ${automation.lastRunSessionId ?? "new"})`,
+        );
         await runAutomation(automation.id);
+        console.log(`[scheduler] automation ${automation.id} started`);
       } catch (error) {
         console.error(`Failed to run scheduled automation ${automation.id}:`, error);
       }
@@ -85,17 +95,18 @@ export async function runAutomation(automationId: string): Promise<{ sessionId: 
     throw new Error("Automation not found");
   }
 
-  const canReuseExisting = automation.reuseSession && automation.lastRunSessionId;
-  const sessionId = canReuseExisting
-    ? automation.lastRunSessionId!
+  // For reuseSession: stable session ID (same across runs)
+  // Otherwise: unique session ID per run
+  const isReuse = automation.reuseSession;
+  const sessionId = isReuse
+    ? (automation.lastRunSessionId ?? createAutomationReuseSessionId(automation.id))
     : createAutomationRunSessionId(automation.id);
 
-  if (canReuseExisting) {
-    // Reuse: close any active stream but keep the platform session alive.
-    // Old events stay in SQLite until the new run's stream closes and replaces them.
-    SessionStream.close(sessionId);
-  } else {
-    // New session: create on the platform
+  // Generate a unique run ID for this invocation (scopes events in SQLite)
+  const runId = crypto.randomUUID();
+
+  // Create platform session only on first run
+  if (!automation.lastRunSessionId) {
     await dependencies.createSession(sessionId, {
       model: automation.model,
       directory: automation.cwd,
@@ -116,27 +127,39 @@ export async function runAutomation(automationId: string): Promise<{ sessionId: 
   });
 
   try {
+    // Skip if this session already has an invocation in-flight
+    if (runningAutomationSessions.has(sessionId)) {
+      return { sessionId };
+    }
+
+    runningAutomationSessions.add(sessionId);
+
+    // Set the run ID BEFORE starting the turn so all events (including user_message) are persisted
+    stream.setRunId(runId);
     stream.startTurn(automation.prompt);
 
-    // Invoke the remote agent — completion is observed via the stream's subscriber
+    // Fire-and-forget: invoke in background so the scheduler tick can finish
     stream
       .invokeRemoteAgentPublic(automation.prompt, automation.model)
-      .then(() => {
-        void finalizeAutomationRun(dependencies, {
+      .then(() =>
+        finalizeAutomationRun(dependencies, {
           automationId: automation.id,
           sessionId,
           success: true,
           updateLastRun: true,
-        });
-      })
+        }),
+      )
       .catch((error) => {
         console.error(`Automation ${automation.id} invocation failed:`, error);
-        void finalizeAutomationRun(dependencies, {
+        return finalizeAutomationRun(dependencies, {
           automationId: automation.id,
           sessionId,
           success: false,
           updateLastRun: true,
         });
+      })
+      .finally(() => {
+        runningAutomationSessions.delete(sessionId);
       });
 
     return { sessionId };

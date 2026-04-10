@@ -45,12 +45,10 @@ async function acquireToken(): Promise<AuthToken> {
       expiresOn: new Date(result.expiresOn),
     };
   } catch (error: unknown) {
-    const message =
-      error instanceof Error ? error.message : String(error);
-    throw new Error(
-      `Failed to acquire auth token via az CLI. ` +
-        `Make sure you are logged in with 'az login'. Error: ${message}`,
-    );
+    const message = error instanceof Error ? error.message : String(error);
+    const fullMessage = `Failed to acquire auth token via az CLI. Make sure you are logged in with 'az login'. Error: ${message}`;
+    console.error(`[remote] ${fullMessage}`);
+    throw new Error(fullMessage);
   }
 }
 

@@ -37,7 +37,9 @@ function createFakeDb(overrides: Partial<AutomationDatabase> = {}): AutomationDa
 function createFakeStream(): SessionStream {
   return {
     startTurn: () => {},
+    setRunId: () => {},
     invokeRemoteAgentPublic: async () => {},
+    getTurnState: () => ({ status: "idle", messages: [] }),
     markSendFailure: () => {},
     detach: () => {},
   } as unknown as SessionStream;
@@ -104,7 +106,7 @@ describe("automation scheduler", () => {
     const result = await runAutomation(automation.id);
 
     expect(createdSessionIds).toHaveLength(1);
-    expect(createdSessionIds[0]).toStartWith("toy-box-auto-reuse-no-prior--run-");
+    expect(createdSessionIds[0]).toBe("toy-box-auto-reuse-no-prior");
     expect(result.sessionId).toBe(createdSessionIds[0]);
   });
 
@@ -137,6 +139,7 @@ describe("automation scheduler", () => {
     const result = await runAutomation(automation.id);
 
     expect(result).toEqual({ sessionId: "session-success" });
+    // Fire-and-forget: only started event fires synchronously
     expect(events).toHaveLength(1);
     expect(events[0]?.type).toBe("automation.started");
   });

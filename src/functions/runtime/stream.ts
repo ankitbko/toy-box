@@ -24,7 +24,6 @@ import { applySessionEvent, createInitialSession } from "@/lib/session/sessionRe
 import type { Attachment, QueuedMessage, SessionEvent } from "@/types";
 import type { Session } from "@/lib/session/sessionReducer";
 import { getSessionMetadataStore } from "../state/sessionStore";
-import { recordCompletedRun } from "../state/sessionHistory";
 
 export type SessionStreamConfig = {
   sessionId: string;
@@ -107,8 +106,8 @@ export class SessionStream {
   #currentTurnId: string | undefined;
   #isDrainingQueue = false;
 
-  // Run ID for event persistence (unique per turn/invocation)
-  #runId: string = crypto.randomUUID();
+  // Run ID for SQLite persistence (set by scheduler for automation runs)
+  #runId: string | undefined;
 
   // ── Constructor ──────────────────────────────────────────────────────
 
@@ -119,17 +118,10 @@ export class SessionStream {
 
   // ── Lifecycle ────────────────────────────────────────────────────────
 
-  /** Full shutdown: persist run history, clear buffer + queue + unread + broadcast. */
+  /** Full shutdown: clear buffer + queue + unread + broadcast. */
   close(): void {
     if (this.#closed) return;
     this.#closed = true;
-
-    // Record this run's messages into the global session history.
-    // This is synchronous (in-memory on globalThis) so querySession
-    // can read it immediately. SQLite write happens in the background.
-    if (this.#turnState.messages.length > 0) {
-      recordCompletedRun(this.sessionId, this.#runId, this.#turnState);
-    }
 
     this.#updateUnreadOnStreamEnd();
     this.#clearBuffer();
@@ -166,27 +158,12 @@ export class SessionStream {
     this.#turnState.model = model;
   }
 
-  // ── Buffer ───────────────────────────────────────────────────────────
-
-  #prepareBuffer(summaryHint?: string): void {
-    this.#buffer.length = 0;
-
-    if (!this.#announcedRunning) {
-      this.#announcedRunning = true;
-      emitSessionRunning(this.sessionId);
-    }
-
-    emitSessionTouched(this.sessionId, { summary: summaryHint });
-
-    // Persist summary to SQLite so it survives refetches
-    if (summaryHint) {
-      getSessionMetadataStore()
-        .then((store) => store.updateSummary(this.sessionId, summaryHint))
-        .catch((err) => {
-          console.error(`[stream] Failed to persist summary:`, err);
-        });
-    }
+  /** Set the run ID for SQLite event persistence (called by scheduler). */
+  setRunId(runId: string): void {
+    this.#runId = runId;
   }
+
+  // ── Buffer ───────────────────────────────────────────────────────────
 
   #appendToBuffer(event: SessionEvent): void {
     if (event.eventId !== undefined) {
@@ -321,7 +298,23 @@ export class SessionStream {
   }
 
   #resetForNewTurn(summaryHint?: string): void {
-    this.#prepareBuffer(summaryHint);
+    // Always clear the buffer — SQLite is the durable store for automation history.
+    // Buffer is only for live streaming to connected subscribers.
+    this.#buffer.length = 0;
+
+    if (!this.#announcedRunning) {
+      this.#announcedRunning = true;
+      emitSessionRunning(this.sessionId);
+    }
+    emitSessionTouched(this.sessionId, { summary: summaryHint });
+
+    // Persist summary to SQLite
+    if (summaryHint) {
+      getSessionMetadataStore()
+        .then((store) => store.updateSummary(this.sessionId, summaryHint))
+        .catch(() => {});
+    }
+
     this.#currentTurnId = undefined;
     this.#adapterState = createEventAdapterState();
 
@@ -350,6 +343,39 @@ export class SessionStream {
     applySessionEvent(this.#turnState, event);
   }
 
+  /**
+   * Persist the completed run's messages to SQLite as consolidated events.
+   * Called after invocation finishes but before the stream is closed/drained.
+   * Writes clean user_message + assistant_message events (not raw deltas).
+   */
+  async #persistRunToSqlite(): Promise<void> {
+    if (!this.#runId) return;
+
+    // Deep-copy messages before async work so mutations don't affect us
+    const messages = this.#turnState.messages.map((m) => ({ ...m }));
+    if (messages.length === 0) return;
+
+    const runId = this.#runId;
+    this.#runId = undefined; // Clear run context after capture
+
+    try {
+      const events: SessionEvent[] = messages.map((msg) =>
+        msg.role === "user"
+          ? { type: "user_message" as const, content: msg.content }
+          : {
+              type: "assistant_message" as const,
+              content: msg.content,
+              toolCalls: msg.toolCalls,
+            },
+      );
+
+      const store = await getSessionMetadataStore();
+      await store.appendRunEvents(this.sessionId, runId, events);
+    } catch (err) {
+      console.error(`[stream] ${this.sessionId} failed to persist run ${runId}:`, err);
+    }
+  }
+
   // ── Remote agent invocation ─────────────────────────────────────────
 
   /** Public entry point for fire-and-forget invocation from createSessionEventStream. */
@@ -360,16 +386,27 @@ export class SessionStream {
   /** Invoke the remote agent and process the SSE event stream. */
   async #invokeRemoteAgent(prompt: string, model?: string): Promise<void> {
     try {
+      console.log(
+        `[stream] ${this.sessionId} invoking agent, buffer=${this.#buffer.length}, closed=${this.#closed}`,
+      );
       const config = getAgentConfig();
       const { events } = await invokeAgent(config, this.sessionId, {
         input: prompt,
         model: model || this.#turnState.model,
       });
 
+      let eventCount = 0;
       for await (const remoteEvent of events) {
         if (this.#closed) break;
+        eventCount++;
         this.#handleRemoteEvent(remoteEvent);
       }
+      console.log(
+        `[stream] ${this.sessionId} invocation done, ${eventCount} events received, buffer=${this.#buffer.length}`,
+      );
+
+      // Persist consolidated messages to SQLite before draining/closing
+      await this.#persistRunToSqlite();
 
       // Stream ended — drain the queue or close (unless already closed by error terminal)
       if (!this.#closed) {
@@ -377,11 +414,28 @@ export class SessionStream {
       }
     } catch (error) {
       console.error(`[stream] ${this.sessionId} invocation error:`, error);
+      // Still persist whatever we have (user_message + partial response)
+      await this.#persistRunToSqlite();
       this.close();
     }
   }
 
   #handleRemoteEvent(remoteEvent: RemoteSdkEvent): void {
+    // Handle error events from the remote agent ({"type": "error", "message": "..."})
+    if (remoteEvent.type === "error") {
+      const raw = remoteEvent as Record<string, unknown>;
+      const errorMessage =
+        (raw.message as string) ??
+        (remoteEvent.data?.message as string) ??
+        "An error occurred on the remote agent.";
+      this.#emit({
+        type: "assistant_message",
+        content: `⚠️ **Agent Error**: ${errorMessage}`,
+      });
+      this.close();
+      return;
+    }
+
     const metadataPatch = getRemoteMetadataPatch(remoteEvent);
     if (metadataPatch) {
       updateSessionSummary(this.sessionId, metadataPatch.summary, {

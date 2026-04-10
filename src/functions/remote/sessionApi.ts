@@ -38,9 +38,9 @@ async function makeRequest<T>(
 
   if (!response.ok) {
     const errorText = await response.text();
-    throw new Error(
-      `Session API ${options.method} ${path} failed (${response.status}): ${errorText}`,
-    );
+    const message = `Session API ${options.method} ${path} failed (${response.status}): ${errorText}`;
+    console.error(`[remote] ${message}`);
+    throw new Error(message);
   }
 
   // 204 No Content (e.g. delete when not found)
@@ -74,7 +74,9 @@ export async function listSessions(
 
   if (!response.ok) {
     const errorText = await response.text();
-    throw new Error(`Failed to list sessions (${response.status}): ${errorText}`);
+    const message = `Failed to list sessions (${response.status}): ${errorText}`;
+    console.error(`[remote] ${message}`);
+    throw new Error(message);
   }
 
   return response.json() as Promise<SessionListResult>;
@@ -106,7 +108,7 @@ export async function createPlatformSession(
     ...request,
     version_indicator: request?.version_indicator ?? {
       type: "version_ref",
-      agent_version: "9",
+      agent_version: "11",
     },
   };
   return makeRequest<SessionResource>(config, "/endpoint/sessions", {

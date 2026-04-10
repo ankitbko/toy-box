@@ -51,6 +51,10 @@ export const connectLogStream = createServerFn({ method: "POST" })
     });
 
     if (!response.ok || !response.body) {
+      if (!response.ok) {
+        const errorText = await response.text().catch(() => "");
+        console.error(`[remote] Log stream failed (${response.status}): ${errorText}`);
+      }
       return emptyStream();
     }
 

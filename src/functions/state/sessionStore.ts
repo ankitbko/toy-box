@@ -68,11 +68,74 @@ export class SessionMetadataStore {
       )
     `);
 
-    // Migrate: add run_id column if missing (for existing databases)
+    // Migrate: if existing table has wrong PK (missing run_id), rebuild it.
+    // This happens when session_events was created before run_id was added.
+    await this.#migrateSessionEventsPrimaryKey();
+  }
+
+  /**
+   * If the session_events table's PRIMARY KEY doesn't include run_id
+   * (legacy schema), rebuild the table with the correct composite key.
+   */
+  async #migrateSessionEventsPrimaryKey(): Promise<void> {
     try {
-      await this.#db.exec(`ALTER TABLE session_events ADD COLUMN run_id TEXT NOT NULL DEFAULT ''`);
-    } catch {
-      // Column already exists — ignore
+      // Check if run_id is part of the primary key by inspecting the CREATE TABLE SQL
+      const { rows } = await this.#db.sql`
+        SELECT sql FROM sqlite_master WHERE type='table' AND name='session_events'
+      `;
+      const createSql = (rows as Array<{ sql: string }>)[0]?.sql ?? "";
+
+      // If the PK already includes run_id, no migration needed
+      if (createSql.includes("run_id") && createSql.includes("PRIMARY KEY")) {
+        // Check if run_id appears BEFORE "PRIMARY KEY" in the CREATE statement,
+        // which means it was defined as a column but might not be in the PK.
+        // A more reliable check: look for run_id within the PRIMARY KEY clause.
+        const pkMatch = createSql.match(/PRIMARY KEY\s*\(([^)]+)\)/i);
+        if (pkMatch && pkMatch[1].includes("run_id")) {
+          return; // Already has correct PK
+        }
+      }
+
+      console.log("[sessionStore] Migrating session_events to include run_id in PRIMARY KEY...");
+
+      await this.#db.exec("BEGIN IMMEDIATE");
+      try {
+        // Add run_id column if it doesn't exist yet
+        try {
+          await this.#db.exec(
+            `ALTER TABLE session_events ADD COLUMN run_id TEXT NOT NULL DEFAULT ''`,
+          );
+        } catch {
+          // Column already exists
+        }
+
+        await this.#db.exec(`
+          CREATE TABLE session_events_new (
+            session_id TEXT NOT NULL,
+            run_id TEXT NOT NULL DEFAULT '',
+            event_index INTEGER NOT NULL,
+            event_json TEXT NOT NULL,
+            PRIMARY KEY (session_id, run_id, event_index)
+          )
+        `);
+        await this.#db.exec(`
+          INSERT INTO session_events_new (session_id, run_id, event_index, event_json)
+          SELECT session_id, COALESCE(run_id, ''), event_index, event_json FROM session_events
+        `);
+        await this.#db.exec(`DROP TABLE session_events`);
+        await this.#db.exec(`ALTER TABLE session_events_new RENAME TO session_events`);
+        await this.#db.exec("COMMIT");
+        console.log("[sessionStore] Migration complete.");
+      } catch (err) {
+        try {
+          await this.#db.exec("ROLLBACK");
+        } catch {
+          // ignore
+        }
+        throw err;
+      }
+    } catch (err) {
+      console.error("[sessionStore] PK migration failed (non-fatal):", err);
     }
   }
 
@@ -163,6 +226,30 @@ export class SessionMetadataStore {
       `;
     } catch (err) {
       console.error(`[sessionStore] appendEvent failed for ${sessionId}:${eventIndex}:`, err);
+      throw err;
+    }
+  }
+
+  /** Atomically append all events for a run (consolidated messages after invocation). */
+  async appendRunEvents(sessionId: string, runId: string, events: SessionEvent[]): Promise<void> {
+    if (events.length === 0) return;
+    try {
+      await this.#db.exec("BEGIN IMMEDIATE");
+      for (let i = 0; i < events.length; i++) {
+        const eventJson = JSON.stringify(events[i]);
+        await this.#db.sql`
+          INSERT OR REPLACE INTO session_events (session_id, run_id, event_index, event_json)
+          VALUES (${sessionId}, ${runId}, ${i}, ${eventJson})
+        `;
+      }
+      await this.#db.exec("COMMIT");
+    } catch (err) {
+      try {
+        await this.#db.exec("ROLLBACK");
+      } catch {
+        // Ignore rollback failures if the transaction has already ended.
+      }
+      console.error(`[sessionStore] appendRunEvents failed for ${sessionId}/${runId}:`, err);
       throw err;
     }
   }

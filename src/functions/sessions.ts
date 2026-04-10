@@ -10,11 +10,7 @@ import { getAgentConfig, hasAgentConfig, deleteSession } from "./state/sessionCa
 import { getSessionMetadataStore } from "./state/sessionStore";
 import { getUnreadSessionIds, markSessionRead } from "./state/unread";
 import { SessionStream, createSessionEventStream } from "./runtime/stream";
-import {
-  getAllMessagesWithSeparators,
-  getLastCompletedState,
-  loadHistoryFromSqlite,
-} from "./state/sessionHistory";
+import { applySessionEvent, createInitialSession } from "@/lib/session/sessionReducer";
 import type {
   Message,
   ModelInfo,
@@ -201,51 +197,34 @@ export const listSessionSkills = createServerFn({ method: "POST" })
 export const querySession = createServerFn({ method: "POST" })
   .inputValidator(zodValidator(sessionInputSchema))
   .handler(async ({ data }): Promise<SessionSnapshot> => {
-    // Load prior run history from SQLite if not yet in memory
-    await loadHistoryFromSqlite(data.sessionId);
+    // Load persisted run history from SQLite (grouped by run_id with separators)
+    const store = await getSessionMetadataStore();
+    const runs = await store.loadEvents(data.sessionId);
+    const historyMessages = replayRunsToMessages(runs);
 
-    // Get all completed run messages with separators
-    const historyMessages = getAllMessagesWithSeparators(data.sessionId);
-
-    // Active stream — merge history with live state
+    // Active stream — merge history with live turn state
     const stream = SessionStream.get(data.sessionId);
-    const streamState = stream?.getTurnState();
-
-    if (streamState) {
-      // Add separator if there's history before the live run
+    if (stream) {
+      const turnState = stream.getTurnState();
+      // Add separator between history and live turn (if there's history)
       const separator: Message[] =
-        historyMessages.length > 0
+        historyMessages.length > 0 && turnState.messages.length > 0
           ? [{ role: "assistant", content: "---\n\n**Previous run ended**\n\n---" }]
           : [];
 
       return {
         id: data.sessionId,
-        messages: [...historyMessages, ...separator, ...streamState.messages],
-        queuedMessages: stream?.getQueuedMessages() ?? [],
-        model: streamState.model,
-        todos: streamState.todos,
-        lastSeenEventId: stream?.getLastEventId(),
-        status: streamState.status,
-        reasoningContent: streamState.reasoningContent,
+        messages: [...historyMessages, ...separator, ...turnState.messages],
+        queuedMessages: stream.getQueuedMessages(),
+        model: turnState.model,
+        todos: turnState.todos,
+        lastSeenEventId: stream.getLastEventId(),
+        status: turnState.status,
+        reasoningContent: turnState.reasoningContent,
       };
     }
 
-    // No active stream — check for just-completed state
-    const completedState = getLastCompletedState(data.sessionId);
-    if (completedState && historyMessages.length === 0) {
-      // Only the latest run, no prior history
-      return {
-        id: data.sessionId,
-        messages: completedState.messages,
-        queuedMessages: [],
-        model: completedState.model,
-        todos: completedState.todos,
-        status: "idle",
-        reasoningContent: "",
-      };
-    }
-
-    // Return all historical messages (includes the latest completed run)
+    // No active stream — return history only
     if (historyMessages.length > 0) {
       return {
         id: data.sessionId,
@@ -256,7 +235,7 @@ export const querySession = createServerFn({ method: "POST" })
       };
     }
 
-    // No history at all — return empty snapshot
+    // No history, no stream — empty
     return {
       id: data.sessionId,
       messages: [],
@@ -265,6 +244,27 @@ export const querySession = createServerFn({ method: "POST" })
       reasoningContent: "",
     };
   });
+
+/** Replay multiple runs into a single message list with separator messages between runs. */
+function replayRunsToMessages(runs: { runId: string; events: SessionEvent[] }[]): Message[] {
+  if (runs.length === 0) return [];
+
+  const allMessages: Message[] = [];
+  for (let i = 0; i < runs.length; i++) {
+    if (i > 0) {
+      allMessages.push({
+        role: "assistant",
+        content: "---\n\n**Previous run ended**\n\n---",
+      });
+    }
+    const runState = createInitialSession();
+    for (const event of runs[i].events) {
+      applySessionEvent(runState, event);
+    }
+    allMessages.push(...runState.messages);
+  }
+  return allMessages;
+}
 
 function createEventByteStream(iterator: AsyncGenerator<SessionEvent>): ReadableStream<Uint8Array> {
   return new ReadableStream<Uint8Array>({

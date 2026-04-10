@@ -80,10 +80,6 @@ export async function deleteSession(sessionId: string): Promise<void> {
   deleteUnreadState(sessionId);
   await cleanupSessionAttachments(sessionId);
 
-  // Clear in-memory run history
-  const { clearSessionHistory } = await import("./sessionHistory");
-  clearSessionHistory(sessionId);
-
   // Delete from local metadata store
   const store = await getSessionMetadataStore();
   await store.delete(sessionId);
