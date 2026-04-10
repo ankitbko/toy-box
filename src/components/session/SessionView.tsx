@@ -14,6 +14,7 @@ import { usePageVisibility } from "@/hooks/browser/usePageVisibility";
 import { StickToBottom, useStickToBottomContext } from "use-stick-to-bottom";
 import type { Attachment, Message, ModelInfo } from "@/types";
 import { sessionQueries, skillQueries } from "@/lib/queries";
+import { isAutomationRunSession } from "@/lib/automation/sessionId";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Message as SessionMessage } from "./messages/Message";
@@ -141,6 +142,7 @@ export function SessionView({
 }: SessionViewProps) {
   // Check if this is a draft session (not yet created on server)
   const isDraft = sessionId === draftSessionId;
+  const isAutomation = isAutomationRunSession(sessionId);
 
   const queryClient = useQueryClient();
 
@@ -336,6 +338,7 @@ export function SessionView({
 
   // Session data from cache - disabled for draft sessions (they don't exist on server yet)
   // and while streaming (local state is authoritative during a stream).
+  // Automation sessions poll every 10s instead of using streaming.
   const {
     data: sessionData,
     error,
@@ -343,6 +346,8 @@ export function SessionView({
   } = useQuery({
     ...sessionQueries.detail(sessionId),
     enabled: !isDraft && !isStreaming,
+    staleTime: isAutomation ? 0 : Infinity,
+    refetchInterval: isAutomation && !isStreaming ? 10_000 : false,
   });
 
   // Skills are directory-scoped — fetch once per CWD, shared across sessions.
@@ -406,6 +411,7 @@ export function SessionView({
   const [resubscribeRequested, setResubscribeRequested] = useState(false);
 
   useEffect(() => {
+    if (isAutomation) return; // Automation sessions use polling, not streaming
     const wasVisible = prevVisibleRef.current;
     if (wasVisible === isVisible) return;
     prevVisibleRef.current = isVisible;
@@ -419,7 +425,7 @@ export function SessionView({
       // Page shown → flag for resubscription
       setResubscribeRequested(true);
     }
-  }, [isVisible, sessionId, detachFromStream, queryClient]);
+  }, [isAutomation, isVisible, sessionId, detachFromStream, queryClient]);
 
   // Subscribe to live events after initial sync OR after returning from background.
   // Fires when the session is actively processing OR when it's idle but has
@@ -444,6 +450,8 @@ export function SessionView({
   const isSessionActive = sessionData?.status !== undefined && sessionData.status !== "idle";
   useEffect(() => {
     if (isDraft) return;
+    // Automation sessions use polling — skip stream subscription entirely
+    if (isAutomation) return;
     if (!isVisible || !hasSynced || isStreamingRef.current) return;
 
     const syncMode = resolveSessionOpenSyncMode({
@@ -478,6 +486,7 @@ export function SessionView({
     clearResubscribeRequest();
   }, [
     isDraft,
+    isAutomation,
     isVisible,
     hasSynced,
     isSessionUnread,
