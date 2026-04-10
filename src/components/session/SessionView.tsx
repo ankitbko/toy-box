@@ -416,11 +416,8 @@ export function SessionView({
       // to cancel the server-side processing - just detach the client.
       detachFromStream();
     } else {
-      // Page shown → refetch session state and flag for resubscription
+      // Page shown → flag for resubscription
       setResubscribeRequested(true);
-      queryClient.invalidateQueries({
-        queryKey: sessionQueries.detail(sessionId).queryKey,
-      });
     }
   }, [isVisible, sessionId, detachFromStream, queryClient]);
 

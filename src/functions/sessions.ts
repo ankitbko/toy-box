@@ -335,6 +335,9 @@ export const destroySession = createServerFn({ method: "POST" })
   .handler(async ({ data }) => {
     SessionStream.close(data.sessionId);
     await deleteSession(data.sessionId);
+    // Clean up persisted events
+    const store = await getSessionMetadataStore();
+    await store.delete(data.sessionId);
     return { success: true };
   });
 

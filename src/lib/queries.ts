@@ -55,9 +55,9 @@ export const sessionQueries = {
     queryOptions({
       queryKey: [...sessionQueries.details(), sessionId] as const,
       queryFn: () => querySession({ data: { sessionId } }),
-      staleTime: 0, // Always refetch to get latest from persistent history
-      refetchOnWindowFocus: "always",
-      refetchOnReconnect: "always",
+      staleTime: Infinity, // Client state is source of truth; only refetch on explicit invalidation
+      refetchOnWindowFocus: false,
+      refetchOnReconnect: false,
       retry: false, // Don't retry on "session not found" errors
     }),
 };

@@ -254,6 +254,37 @@ export class SessionMetadataStore {
     }
   }
 
+  /** Append events to an existing run, continuing from the max event_index. */
+  async appendToRun(sessionId: string, runId: string, events: SessionEvent[]): Promise<void> {
+    if (events.length === 0) return;
+    try {
+      await this.#db.exec("BEGIN IMMEDIATE");
+      // Find current max event_index for this run
+      const { rows } = await this.#db.sql`
+        SELECT COALESCE(MAX(event_index), -1) as max_idx
+        FROM session_events WHERE session_id = ${sessionId} AND run_id = ${runId}
+      `;
+      const startIndex = ((rows as Array<{ max_idx: number }>)[0]?.max_idx ?? -1) + 1;
+      for (let i = 0; i < events.length; i++) {
+        const eventJson = JSON.stringify(events[i]);
+        const idx = startIndex + i;
+        await this.#db.sql`
+          INSERT INTO session_events (session_id, run_id, event_index, event_json)
+          VALUES (${sessionId}, ${runId}, ${idx}, ${eventJson})
+        `;
+      }
+      await this.#db.exec("COMMIT");
+    } catch (err) {
+      try {
+        await this.#db.exec("ROLLBACK");
+      } catch {
+        // Ignore rollback failures
+      }
+      console.error(`[sessionStore] appendToRun failed for ${sessionId}/${runId}:`, err);
+      throw err;
+    }
+  }
+
   /** Load all events for a session, ordered by run_id then event_index */
   async loadEvents(sessionId: string): Promise<{ runId: string; events: SessionEvent[] }[]> {
     const { rows } = await this.#db.sql`

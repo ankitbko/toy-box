@@ -347,16 +347,20 @@ export class SessionStream {
    * Persist the completed run's messages to SQLite as consolidated events.
    * Called after invocation finishes but before the stream is closed/drained.
    * Writes clean user_message + assistant_message events (not raw deltas).
+   *
+   * For automation sessions (runId set by scheduler): events are scoped by runId
+   * so multiple runs accumulate independently.
+   * For regular sessions: uses a fixed runId and appends events with incrementing
+   * indices so multi-turn conversations accumulate in a single run.
    */
   async #persistRunToSqlite(): Promise<void> {
-    if (!this.#runId) return;
+    const isAutomation = this.#runId !== undefined;
+    const runId = this.#runId ?? "chat";
+    this.#runId = undefined; // Clear run context after capture
 
     // Deep-copy messages before async work so mutations don't affect us
     const messages = this.#turnState.messages.map((m) => ({ ...m }));
     if (messages.length === 0) return;
-
-    const runId = this.#runId;
-    this.#runId = undefined; // Clear run context after capture
 
     try {
       const events: SessionEvent[] = messages.map((msg) =>
@@ -370,7 +374,14 @@ export class SessionStream {
       );
 
       const store = await getSessionMetadataStore();
-      await store.appendRunEvents(this.sessionId, runId, events);
+
+      if (isAutomation) {
+        // Automation: each run is stored independently (starting at index 0)
+        await store.appendRunEvents(this.sessionId, runId, events);
+      } else {
+        // Regular session: append to existing run, continuing the event index
+        await store.appendToRun(this.sessionId, runId, events);
+      }
     } catch (err) {
       console.error(`[stream] ${this.sessionId} failed to persist run ${runId}:`, err);
     }

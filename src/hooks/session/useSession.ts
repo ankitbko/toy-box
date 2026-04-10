@@ -79,9 +79,12 @@ export function useSession(sessionId: string, sessionConfig?: SessionConfig) {
   // ---------------------------------------------------------------------------
   const setCachedMessages = useCallback(
     (messages: Message[]) => {
-      queryClient.setQueryData<Session>(detailQueryKey, (old) =>
-        old ? { ...old, messages } : undefined,
-      );
+      queryClient.setQueryData<Session>(detailQueryKey, (old) => {
+        if (old) return { ...old, messages };
+        // No prior cached data (e.g., draft session that just started).
+        // Create a minimal snapshot so the query doesn't refetch empty state.
+        return createInitialSession({ messages, status: "idle" });
+      });
     },
     [queryClient, detailQueryKey],
   );
@@ -358,7 +361,6 @@ export function useSession(sessionId: string, sessionConfig?: SessionConfig) {
             onSuccess: () => {
               notifyDraftCreated();
               setCachedMessages(sessionRef.current!.state.messages);
-              void invalidateDetailQuery();
             },
           },
         );
@@ -446,7 +448,7 @@ export function useSession(sessionId: string, sessionConfig?: SessionConfig) {
       });
       // Reconcile against persistent history when a passive subscribe completes.
       if (!result.wasAborted) {
-        await invalidateDetailQuery();
+        setCachedMessages(sessionRef.current!.state.messages);
       }
     } catch (error) {
       // AbortErrors are expected when navigating away or detaching
@@ -455,7 +457,7 @@ export function useSession(sessionId: string, sessionConfig?: SessionConfig) {
       console.error("Subscription error:", error);
       await invalidateDetailQuery().catch(() => {});
     }
-  }, [invalidateDetailQuery, runStreamingLoop, sessionId]);
+  }, [invalidateDetailQuery, setCachedMessages, runStreamingLoop, sessionId]);
 
   /** Detach from the stream without canceling server-side processing.
    *  Used when backgrounding the app - server continues buffering for reconnect.
