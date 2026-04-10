@@ -11,6 +11,7 @@ import { getSessionMetadataStore } from "./state/sessionStore";
 import { getUnreadSessionIds, markSessionRead } from "./state/unread";
 import { SessionStream, createSessionEventStream } from "./runtime/stream";
 import { applySessionEvent, createInitialSession } from "@/lib/session/sessionReducer";
+import { isAutomationRunSession } from "@/lib/automation/sessionId";
 import type {
   Message,
   ModelInfo,
@@ -201,6 +202,19 @@ export const querySession = createServerFn({ method: "POST" })
     const store = await getSessionMetadataStore();
     const runs = await store.loadEvents(data.sessionId);
     const historyMessages = replayRunsToMessages(runs);
+
+    // For automation sessions, SQLite is the sole source of truth (UI uses polling).
+    // Don't merge with live stream to avoid duplicating the latest run's messages.
+    const isAutomation = isAutomationRunSession(data.sessionId);
+    if (isAutomation) {
+      return {
+        id: data.sessionId,
+        messages: historyMessages,
+        queuedMessages: [],
+        status: "idle",
+        reasoningContent: "",
+      };
+    }
 
     // Active stream — merge history with live turn state
     const stream = SessionStream.get(data.sessionId);
