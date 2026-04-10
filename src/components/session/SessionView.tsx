@@ -411,7 +411,6 @@ export function SessionView({
   const [resubscribeRequested, setResubscribeRequested] = useState(false);
 
   useEffect(() => {
-    if (isAutomation) return; // Automation sessions use polling, not streaming
     const wasVisible = prevVisibleRef.current;
     if (wasVisible === isVisible) return;
     prevVisibleRef.current = isVisible;
@@ -425,7 +424,7 @@ export function SessionView({
       // Page shown → flag for resubscription
       setResubscribeRequested(true);
     }
-  }, [isAutomation, isVisible, sessionId, detachFromStream, queryClient]);
+  }, [isVisible, sessionId, detachFromStream, queryClient]);
 
   // Subscribe to live events after initial sync OR after returning from background.
   // Fires when the session is actively processing OR when it's idle but has
@@ -450,8 +449,6 @@ export function SessionView({
   const isSessionActive = sessionData?.status !== undefined && sessionData.status !== "idle";
   useEffect(() => {
     if (isDraft) return;
-    // Automation sessions use polling — skip stream subscription entirely
-    if (isAutomation) return;
     if (!isVisible || !hasSynced || isStreamingRef.current) return;
 
     const syncMode = resolveSessionOpenSyncMode({
@@ -486,7 +483,6 @@ export function SessionView({
     clearResubscribeRequest();
   }, [
     isDraft,
-    isAutomation,
     isVisible,
     hasSynced,
     isSessionUnread,

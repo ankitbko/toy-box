@@ -27,6 +27,7 @@ import {
 import { sessionQueries, skillQueries } from "@/lib/queries";
 import { setSessionStreaming } from "@/lib/session/sessionsCache";
 import { decodeSessionEvents } from "@/lib/session/streamCodec";
+import { isAutomationRunSession } from "@/lib/automation/sessionId";
 import { generateUUID } from "@/lib/utils";
 
 const THINKING_STATUS: SessionStatus = "thinking";
@@ -446,8 +447,9 @@ export function useSession(sessionId: string, sessionConfig?: SessionConfig) {
         sessionId,
         afterEventId: sessionRef.current!.state.lastSeenEventId,
       });
-      // Reconcile against persistent history when a passive subscribe completes.
-      if (!result.wasAborted) {
+      // For regular sessions: cache the final state so it survives query refetch.
+      // For automation sessions: skip — polling handles the transition to SQLite state.
+      if (!result.wasAborted && !isAutomationRunSession(sessionId)) {
         setCachedMessages(sessionRef.current!.state.messages);
       }
     } catch (error) {
